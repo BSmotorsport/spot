@@ -234,22 +234,19 @@ def build_grouped_split_files(image_folder: str, seed: int, val_frac: float):
 
 def create_gaussian_heatmap(coords_norm, heatmap_size=HEATMAP_SIZE, sigma=2.0):
     """Create Gaussian heatmap for given normalized coordinates"""
-    heatmap = np.zeros((heatmap_size, heatmap_size))
-    
+    heatmap = np.zeros((heatmap_size, heatmap_size), dtype=np.float32)
+
     # Convert normalized coords to heatmap coordinates
     x = int(coords_norm[0] * heatmap_size)
     y = int(coords_norm[1] * heatmap_size)
-    
+
     # Ensure coordinates are within bounds
     x = np.clip(x, 0, heatmap_size - 1)
     y = np.clip(y, 0, heatmap_size - 1)
-    
-    # Create Gaussian centered at (x, y)
-    for i in range(max(0, x-10), min(heatmap_size, x+11)):
-        for j in range(max(0, y-10), min(heatmap_size, y+11)):
-            dist_sq = (i - x) ** 2 + (j - y) ** 2
-            heatmap[j, i] = np.exp(-dist_sq / (2 * sigma ** 2))
-    
+
+    heatmap[y, x] = 1.0
+    heatmap = gaussian_filter(heatmap, sigma=sigma)
+
     return heatmap
 
 class HighResSpotBallDataset(Dataset):
