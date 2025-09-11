@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.checkpoint")
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
-    # Set random seeds for reproducibility
+# Set random seeds for reproducibility
 def set_seed(seed=42, deterministic=True):
     """Set consistent seeds and performance settings"""
     torch.manual_seed(seed)
@@ -42,9 +42,6 @@ def set_seed(seed=42, deterministic=True):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
-index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
-++ b/superbotb_highres_cached.py
     else:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
@@ -438,9 +435,6 @@ def train_model(
                 optimizer.step()
             
             pixel_error = calculate_pixel_error(predictions, targets, ORIGINAL_IMAGE_SIZE)
-diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
-index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
-++ b/superbotb_highres_cached.py
             train_pixel_errors.extend(pixel_error.detach().cpu().numpy())
             train_losses.append(loss.item())
             
@@ -519,9 +513,6 @@ index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025
                 
                 # Create individual sample predictions for detailed sanity checking
                 create_detailed_sample_predictions(model, val_loader, device, checkpoint_dir, epoch)
-diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
-index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
-++ b/superbotb_highres_cached.py
                 
         except Exception as e:
             print(f"Could not create plots: {e}")
@@ -754,8 +745,6 @@ def main():
         print(f"  Original (4416x3336): ({pred_original[0]:.1f}, {pred_original[1]:.1f})")
         print("Inference completed!")
 
-EOF
-)
 def create_training_plots(history, checkpoint_dir, epoch):
     """Create and save training progress plots"""
     import matplotlib.pyplot as plt
