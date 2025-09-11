@@ -431,38 +431,38 @@ class EnhancedSpotBallModel(nn.Module):
         return heatmap.squeeze(1), coords
 
 def soft_argmax_2d(heatmap, temperature=1.0, coord_grids=None):
-    """Extract coordinates from heatmap using differentiable soft-argmax
-    
+    """Extract coordinates from heatmap using differentiable soft-argmax.
+
     Args:
-        heatmap: Batch of heatmaps (B, H, W)
-        temperature: Temperature for softmax sharpness
-        coord_grids: Pre-computed coordinate grids (optional)
+        heatmap: Batch of heatmaps of shape ``(B, H, W)``.
+        temperature: Temperature for softmax sharpness.
+        coord_grids: Tuple of pre-computed ``(x_coords, y_coords)``.
+            Supplying these avoids repeatedly creating coordinate tensors.
     """
     batch_size, height, width = heatmap.shape
-    
-    # Apply temperature scaling
+
+    # Apply temperature scaling and normalize to probability distribution
     heatmap = heatmap / temperature
-    
-    # Normalize to probability distribution
     heatmap = heatmap.view(batch_size, -1)
     heatmap = F.softmax(heatmap, dim=1)
     heatmap = heatmap.view(batch_size, height, width)
-    
-    # Use pre-computed grids if provided, otherwise create them
+
+    # Use pre-computed grids if provided, otherwise create them on the fly
     if coord_grids is None:
         x_coords = torch.linspace(0, 1, width, device=heatmap.device)
         y_coords = torch.linspace(0, 1, height, device=heatmap.device)
     else:
         x_coords, y_coords = coord_grids
-    
+
     # Compute expected coordinates
     x_exp = (heatmap.sum(dim=1) * x_coords).sum(dim=1)
     y_exp = (heatmap.sum(dim=2) * y_coords).sum(dim=1)
-    
+
     return torch.stack([x_exp, y_exp], dim=1)
 
 class CombinedLoss(nn.Module):
     """Combined loss for heatmap and direct regression"""
+
     def __init__(self, heatmap_weight=1.0, regression_weight=0.5, coordinate_weight=0.3):
         super().__init__()
         self.heatmap_weight = heatmap_weight
@@ -470,31 +470,33 @@ class CombinedLoss(nn.Module):
         self.coordinate_weight = coordinate_weight
         self.bce = nn.BCEWithLogitsLoss()
         self.mse = nn.MSELoss()
-        
-    def forward(self, heatmap_pred, coords_pred, heatmap_gt, coords_gt):
+
+    def forward(self, heatmap_pred, coords_pred, heatmap_gt, coords_gt, coord_grids=None):
         # Heatmap loss (BCE)
         heatmap_loss = self.bce(heatmap_pred, heatmap_gt)
-        
+
         # Direct regression loss
         regression_loss = self.mse(coords_pred, coords_gt)
-        
-        # Extract coordinates from predicted heatmap
-        heatmap_coords = soft_argmax_2d(torch.sigmoid(heatmap_pred))
+
+        # Extract coordinates from predicted heatmap using pre-computed grids
+        heatmap_coords = soft_argmax_2d(torch.sigmoid(heatmap_pred), coord_grids=coord_grids)
         coordinate_loss = self.mse(heatmap_coords, coords_gt)
-        
+
         # Add regularization for out-of-bounds predictions
         oob_penalty = (torch.relu(coords_pred - 1) + torch.relu(-coords_pred)).mean()
-        
-        total_loss = (self.heatmap_weight * heatmap_loss + 
-                     self.regression_weight * regression_loss +
-                     self.coordinate_weight * coordinate_loss +
-                     0.1 * oob_penalty)
-        
+
+        total_loss = (
+            self.heatmap_weight * heatmap_loss
+            + self.regression_weight * regression_loss
+            + self.coordinate_weight * coordinate_loss
+            + 0.1 * oob_penalty
+        )
+
         return total_loss, {
             'heatmap': heatmap_loss.item(),
             'regression': regression_loss.item(),
             'coordinate': coordinate_loss.item(),
-            'out_of_bounds': oob_penalty.item()
+            'out_of_bounds': oob_penalty.item(),
         }
 
 def calculate_pixel_error(predictions, targets, original_size):
@@ -567,7 +569,7 @@ def train_model(
     best_val_error = float("inf")
     best_val_loss = float("inf")
     history = {
-        "train_loss": [], "val_loss": [], 
+        "train_loss": [], "val_loss": [],
         "train_error": [], "val_error": [],
         "learning_rate": [], "loss_components": []
     }
@@ -580,6 +582,12 @@ def train_model(
 
     epochs_no_improve = 0
     early_stop_patience = 15
+
+    # Pre-compute coordinate grids for soft argmax to avoid repeated creation
+    coord_grids = (
+        torch.linspace(0, 1, model.heatmap_size, device=device),
+        torch.linspace(0, 1, model.heatmap_size, device=device),
+    )
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -599,7 +607,9 @@ def train_model(
             if scaler and device.type == 'cuda':
                 with torch.amp.autocast('cuda'):
                     heatmap_pred, coords_pred = model(images)
-                    loss, components = criterion(heatmap_pred, coords_pred, heatmaps_gt, coords_gt)
+                    loss, components = criterion(
+                        heatmap_pred, coords_pred, heatmaps_gt, coords_gt, coord_grids
+                    )
                 
                 scaler.scale(loss).backward()
                 
@@ -611,7 +621,9 @@ def train_model(
                 scaler.update()
             else:
                 heatmap_pred, coords_pred = model(images)
-                loss, components = criterion(heatmap_pred, coords_pred, heatmaps_gt, coords_gt)
+                loss, components = criterion(
+                    heatmap_pred, coords_pred, heatmaps_gt, coords_gt, coord_grids
+                )
                 loss.backward()
                 
                 # Gradient clipping
@@ -621,7 +633,9 @@ def train_model(
             
             # Extract coordinates from heatmap for error calculation
             with torch.no_grad():
-                pred_coords = soft_argmax_2d(torch.sigmoid(heatmap_pred))
+                pred_coords = soft_argmax_2d(
+                    torch.sigmoid(heatmap_pred), coord_grids=coord_grids
+                )
             
             pixel_error = calculate_pixel_error(pred_coords, coords_gt, ORIGINAL_IMAGE_SIZE)
             train_pixel_errors.extend(pixel_error.detach().cpu().numpy())
@@ -651,15 +665,21 @@ def train_model(
                 if scaler and device.type == 'cuda':
                     with torch.amp.autocast('cuda'):
                         heatmap_pred, coords_pred = model(images)
-                        loss, _ = criterion(heatmap_pred, coords_pred, heatmaps_gt, coords_gt)
+                        loss, _ = criterion(
+                            heatmap_pred, coords_pred, heatmaps_gt, coords_gt, coord_grids
+                        )
                 else:
                     heatmap_pred, coords_pred = model(images)
-                    loss, _ = criterion(heatmap_pred, coords_pred, heatmaps_gt, coords_gt)
+                    loss, _ = criterion(
+                        heatmap_pred, coords_pred, heatmaps_gt, coords_gt, coord_grids
+                    )
                 
                 val_losses.append(loss.item())
                 
                 # Extract coordinates from heatmap
-                pred_coords = soft_argmax_2d(torch.sigmoid(heatmap_pred))
+                pred_coords = soft_argmax_2d(
+                    torch.sigmoid(heatmap_pred), coord_grids=coord_grids
+                )
                 pixel_error = calculate_pixel_error(pred_coords, coords_gt, ORIGINAL_IMAGE_SIZE)
                 val_pixel_errors.extend(pixel_error.detach().cpu().numpy())
                 
@@ -1020,8 +1040,14 @@ def main():
         # Predict
         with torch.no_grad():
             heatmap_pred, coords_pred = model(image)
-            # Extract coordinates from heatmap
-            pred_coords = soft_argmax_2d(torch.sigmoid(heatmap_pred))
+            # Extract coordinates from heatmap using pre-computed grids
+            coord_grids = (
+                torch.linspace(0, 1, model.heatmap_size, device=device),
+                torch.linspace(0, 1, model.heatmap_size, device=device),
+            )
+            pred_coords = soft_argmax_2d(
+                torch.sigmoid(heatmap_pred), coord_grids=coord_grids
+            )
             pred_coords = pred_coords.cpu().numpy()[0]
         
         # Scale to original coordinates
