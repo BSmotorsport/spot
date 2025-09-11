@@ -335,7 +335,10 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
     history = {'train_loss': [], 'val_loss': [], 'train_error': [], 'val_error': []}
     
     # Mixed precision scaler (single declaration)
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    if device.type == 'cuda':
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        scaler = None
     
     for epoch in range(start_epoch, num_epochs):
         model.train()

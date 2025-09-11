@@ -404,7 +404,10 @@ def train_model(
     history = {"train_loss": [], "val_loss": [], "train_error": [], "val_error": []}
 
     # Mixed precision scaler (single declaration)
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    if device.type == "cuda":
+        scaler = torch.amp.GradScaler("cuda")
+    else:
+        scaler = None
 
     epochs_no_improve = 0
     if auto_mode and early_stop_patience is None:
