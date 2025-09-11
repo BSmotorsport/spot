@@ -536,12 +536,14 @@ def train_model(
     optimizer_state=None,
     scheduler_state=None,
     warmup_epochs=2,
+    grad_checkpoint=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    # Enable gradient checkpointing for memory efficiency
-    if hasattr(model.backbone, "set_grad_checkpointing"):
+    # Enable gradient checkpointing when requested
+    # Saves memory at the cost of extra compute and slower training
+    if grad_checkpoint and hasattr(model.backbone, "set_grad_checkpointing"):
         model.backbone.set_grad_checkpointing(True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
@@ -920,6 +922,8 @@ def main():
                         help='Batch size (use 1 for high resolution)')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='Learning rate')
+    parser.add_argument('--grad_checkpoint', action='store_true',
+                        help='Enable gradient checkpointing; reduces memory usage at the cost of extra compute and slower training')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -1010,6 +1014,7 @@ def main():
             start_epoch=start_epoch,
             optimizer_state=optimizer_state,
             scheduler_state=scheduler_state,
+            grad_checkpoint=args.grad_checkpoint,
         )
         
         print("Training completed!")
