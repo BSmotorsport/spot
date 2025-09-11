@@ -1,4 +1,522 @@
-import os
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
+index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
+--- a/superbotb_highres_cached.py
++++ b/superbotb_highres_cached.py
+@@ -1,40 +1,44 @@
+ import os
+ import re
+ import numpy as np
+ import torch
+ import torch.nn as nn
+ from torch.utils.data import Dataset, DataLoader
+ from torchvision import transforms
+ from PIL import Image
+ import timm
+ import argparse
+ from pathlib import Path
+ import json
+ from typing import List, Tuple, Optional
+ from tqdm import tqdm
+ import warnings
++import time
++import subprocess
++import shutil
++import torch.utils.benchmark as benchmark
+ 
+ # Suppress warnings for cleaner output
+ warnings.filterwarnings("ignore", category=UserWarning)
+ warnings.filterwarnings("ignore", category=FutureWarning)
+ warnings.filterwarnings("ignore", category=DeprecationWarning)
+ 
+ # Performance optimizations and reproducibility
+ torch.backends.cudnn.benchmark = True
+ torch.backends.cudnn.deterministic = False
+ import warnings
+ warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
+ warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.checkpoint")
+ warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+ 
+     # Set random seeds for reproducibility
+ def set_seed(seed=42, deterministic=True):
+     """Set consistent seeds and performance settings"""
+     torch.manual_seed(seed)
+     torch.cuda.manual_seed(seed)
+     torch.cuda.manual_seed_all(seed)
+     np.random.seed(seed)
+     
+     if deterministic:
+         torch.backends.cudnn.deterministic = True
+         torch.backends.cudnn.benchmark = False
+diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
+index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
+--- a/superbotb_highres_cached.py
++++ b/superbotb_highres_cached.py
+@@ -287,78 +291,147 @@ class ConvNeXtSpotModel(nn.Module):
+             nn.ReLU(),
+             nn.Dropout(0.2),
+             nn.Linear(1024, 512),
+             nn.ReLU(),
+             nn.Dropout(0.2),
+             nn.Linear(512, 2)
+         )
+         
+         for name, param in self.backbone.named_parameters():
+             if 'stages.0' in name or 'stages.1' in name:
+                 param.requires_grad = False
+     
+     def forward(self, x):
+         features = self.backbone(x)
+         return self.head(features)
+ 
+ def calculate_pixel_error(predictions, targets, original_size):
+     """Calculate pixel error in original image coordinates with bounds checking"""
+     # Ensure predictions are within [0,1] range
+     pred_x = torch.clamp(predictions[:, 0], 0, 1) * original_size[0]
+     pred_y = torch.clamp(predictions[:, 1], 0, 1) * original_size[1]
+     
+     # Ensure targets are within [0,1] range
+     target_x = torch.clamp(targets[:, 0], 0, 1) * original_size[0]
+     target_y = torch.clamp(targets[:, 1], 0, 1) * original_size[1]
+-    
++
+     return torch.sqrt((pred_x - target_x) ** 2 + (pred_y - target_y) ** 2)
+ 
+-def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1e-4, checkpoint_dir='./checkpoints', start_epoch=0, optimizer_state=None, scheduler_state=None):
+-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++
++def profile_bottlenecks(model, train_loader, device, num_batches: int = 20):
++    """Rudimentary profiling for data loading and model forward time."""
++    model.eval()
++
++    load_times = []
++    data_iter = iter(train_loader)
++    for _ in range(num_batches):
++        start = time.perf_counter()
++        try:
++            batch = next(data_iter)
++        except StopIteration:
++            data_iter = iter(train_loader)
++            batch = next(data_iter)
++        load_times.append(time.perf_counter() - start)
++
++    images, targets, _ = batch
++    images = images.to(device)
++
++    timer = benchmark.Timer(
++        stmt="model(images)",
++        globals={"model": model, "images": images},
++    )
++    result = timer.timeit(20)
++
++    print(f"Avg data loading time: {np.mean(load_times):.4f}s")
++    print(
++        f"Forward pass: {result.mean:.4f}s ± {result.stddev:.4f}s (n={result.number})"
++    )
++
++    if shutil.which("nvidia-smi"):
++        try:
++            print("nvidia-smi utilization:")
++            subprocess.run(["nvidia-smi"], check=False)
++        except Exception as e:
++            print(f"Failed to run nvidia-smi: {e}")
++    else:
++        print("nvidia-smi not found; install NVIDIA drivers to profile GPU utilization.")
++
++def train_model(
++    model,
++    train_loader,
++    val_loader,
++    num_epochs=100,
++    learning_rate=1e-4,
++    checkpoint_dir="./checkpoints",
++    start_epoch=0,
++    optimizer_state=None,
++    scheduler_state=None,
++    scheduler_type="auto",
++    lr_factor=0.1,
++    lr_patience=5,
++    early_stop_patience=None,
++):
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+     model = model.to(device)
+-    
++
+     # Enable gradient checkpointing for memory efficiency
+-    if hasattr(model.backbone, 'set_grad_checkpointing'):
++    if hasattr(model.backbone, "set_grad_checkpointing"):
+         model.backbone.set_grad_checkpointing(True)
+-    
++
+     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)
+-    
++
++    auto_mode = scheduler_type == "auto"
++    if scheduler_type == "plateau":
++        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
++            optimizer, mode="min", factor=lr_factor, patience=lr_patience
++        )
++        current_scheduler = "plateau"
++    else:
++        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
++            optimizer, T_0=5, T_mult=2, eta_min=1e-6
++        )
++        current_scheduler = "cosine"
++
+     # Load optimizer and scheduler states if resuming
+     if optimizer_state is not None:
+         optimizer.load_state_dict(optimizer_state)
+     if scheduler_state is not None:
+         scheduler.load_state_dict(scheduler_state)
+     os.makedirs(checkpoint_dir, exist_ok=True)
+-    
++
+     criterion = nn.HuberLoss(delta=0.5)  # More aggressive outlier handling
+     best_val_error = float("inf")
+-    history = {'train_loss': [], 'val_loss': [], 'train_error': [], 'val_error': []}
+-    
++    best_val_loss = float("inf")
++    history = {"train_loss": [], "val_loss": [], "train_error": [], "val_error": []}
++
+     # Mixed precision scaler (single declaration)
+-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+-    
++    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
++
++    epochs_no_improve = 0
++    if auto_mode and early_stop_patience is None:
++        early_stop_patience = lr_patience * 2
++
+     for epoch in range(start_epoch, num_epochs):
+         model.train()
+         train_losses, train_pixel_errors = [], []
+         
+         # Progress bar for training
+         train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
+         
+         for batch_idx, (images, targets, filenames) in enumerate(train_bar):
+             images, targets = images.to(device), targets.to(device)
+             optimizer.zero_grad(set_to_none=True)
+             
+             if scaler and device.type == 'cuda':
+                 with torch.amp.autocast('cuda'):
+                     predictions = model(images)
+                     loss = criterion(predictions, targets)
+                 scaler.scale(loss).backward()
+                 scaler.step(optimizer)
+                 scaler.update()
+             else:
+                 predictions = model(images)
+                 loss = criterion(predictions, targets)
+                 loss.backward()
+                 optimizer.step()
+             
+             pixel_error = calculate_pixel_error(predictions, targets, ORIGINAL_IMAGE_SIZE)
+diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
+index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
+--- a/superbotb_highres_cached.py
++++ b/superbotb_highres_cached.py
+@@ -381,54 +454,62 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
+                 if scaler and device.type == 'cuda':
+                     with torch.amp.autocast('cuda'):
+                         predictions = model(images)
+                         loss = criterion(predictions, targets)
+                 else:
+                     predictions = model(images)
+                     loss = criterion(predictions, targets)
+                 val_losses.append(loss.item())
+                 
+                 pixel_error = calculate_pixel_error(predictions, targets, ORIGINAL_IMAGE_SIZE)
+                 val_pixel_errors.extend(pixel_error.detach().cpu().numpy())
+                 
+                 # Let PyTorch handle memory management automatically
+                 # torch.cuda.empty_cache()  # Removed - let PyTorch manage memory
+         
+         avg_train_error = np.mean(train_pixel_errors)
+         avg_val_error = np.mean(val_pixel_errors)
+         avg_train_loss = np.mean(train_losses)
+         avg_val_loss = np.mean(val_losses)
+         
+         # Store metrics in history
+         history['train_loss'].append(avg_train_loss)
+         history['val_loss'].append(avg_val_loss)
+         history['train_error'].append(avg_train_error)
+         history['val_error'].append(avg_val_error)
+-        
+-        # Store learning rate for plots
+-        history.setdefault('learning_rate', []).append(scheduler.get_last_lr()[0])
+-        
++
++        # Track learning rate and scheduler type
++        history.setdefault('learning_rate', []).append(optimizer.param_groups[0]['lr'])
++        history.setdefault('scheduler', []).append(current_scheduler)
++
++        # Track validation loss improvements for scheduling/early stopping
++        if avg_val_loss < best_val_loss:
++            best_val_loss = avg_val_loss
++            epochs_no_improve = 0
++        else:
++            epochs_no_improve += 1
++
+         print(f"Epoch {epoch+1}/{num_epochs} | "
+               f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
+               f"Train Error: {avg_train_error:.2f}px | Val Error: {avg_val_error:.2f}px")
+         
+         # Create visualizations
+         try:
+             create_training_plots(history, checkpoint_dir, epoch)
+             
+             # Create sample predictions for sanity checking
+             if val_loader is not None and len(val_loader.dataset) > 0:
+                 # Get sample files for visualization
+                 sample_files = []
+                 dataset = val_loader.dataset
+                 indices = np.random.choice(len(dataset), min(6, len(dataset)), replace=False)
+                 for idx in indices:
+                     _, _, filename = dataset[idx]
+                     sample_files.append(filename)
+                 
+                 create_prediction_visualizations(
+                     model, val_loader.dataset, sample_files, device, 
+                     checkpoint_dir, epoch, original_size=(4416, 3336)
+                 )
+                 
+                 # Create individual sample predictions for detailed sanity checking
+                 create_detailed_sample_predictions(model, val_loader, device, checkpoint_dir, epoch)
+diff --git a/superbotb_highres_cached.py b/superbotb_highres_cached.py
+index aa1ba00715476d21a2f5455f0b3a4da18b5dd625..24f9b13f9ad2b2919910c152b2d30025e63b5963 100644
+--- a/superbotb_highres_cached.py
++++ b/superbotb_highres_cached.py
+@@ -436,181 +517,213 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
+         except Exception as e:
+             print(f"Could not create plots: {e}")
+         
+         if avg_val_error < best_val_error:
+             old_best = best_val_error
+             best_val_error = avg_val_error
+             torch.save({
+                 'epoch': epoch,
+                 'model_state_dict': model.state_dict(),
+                 'optimizer_state_dict': optimizer.state_dict(),
+                 'scheduler_state_dict': scheduler.state_dict(),
+                 'best_val_error': best_val_error
+             }, os.path.join(checkpoint_dir, 'checkpoint_best.pth'))
+             print(f"🎯 NEW BEST! Val error improved from {old_best:.2f} to {best_val_error:.2f}px")
+         else:
+             print(f"📊 Val error: {avg_val_error:.2f}px (best: {best_val_error:.2f}px)")
+         
+         torch.save({
+             'epoch': epoch,
+             'model_state_dict': model.state_dict(),
+             'optimizer_state_dict': optimizer.state_dict(),
+             'scheduler_state_dict': scheduler.state_dict(),
+             'best_val_error': best_val_error
+         }, os.path.join(checkpoint_dir, 'checkpoint_latest.pth'))
+         
+-        # Note: scheduler.step() is called per-epoch for simplicity
+-        # For more granular scheduling, you could use per-batch stepping
+-        scheduler.step()
+-    
++        # Scheduler handling and early stopping
++        if auto_mode and current_scheduler == 'cosine' and epochs_no_improve >= lr_patience:
++            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
++                optimizer, mode='min', factor=lr_factor, patience=lr_patience
++            )
++            current_scheduler = 'plateau'
++            epochs_no_improve = 0
++            print(f"🔄 Switching scheduler to ReduceLROnPlateau (factor={lr_factor}, patience={lr_patience})")
++
++        if current_scheduler == 'plateau':
++            scheduler.step(avg_val_loss)
++        else:
++            scheduler.step()
++
++        if auto_mode and current_scheduler == 'plateau' and epochs_no_improve >= early_stop_patience:
++            print(f"⏹ Early stopping: no improvement for {early_stop_patience} epochs under ReduceLROnPlateau")
++            break
++
+     return model, history
+ 
+ def main():
+     parser = argparse.ArgumentParser(description='High-Resolution Spot-the-Ball Model with SSD Cache')
+     parser.add_argument('--mode', choices=['train', 'inference', 'cache'], required=True,
+                         help='Mode: train, inference, or cache creation')
+     parser.add_argument('--data_dir', type=str, default='E:/botb/dataset/aug',
+                         help='Path to dataset directory')
+     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                         help='Directory to save/load checkpoints')
+     parser.add_argument('--epochs', type=int, default=100,
+                         help='Number of training epochs')
+     parser.add_argument('--batch_size', type=int, default=1,
+                         help='Batch size (use 1 for high resolution)')
+     parser.add_argument('--learning_rate', type=float, default=1e-4,
+                         help='Learning rate')
++    parser.add_argument('--scheduler', choices=['cosine', 'plateau', 'auto'], default='auto',
++                        help='Learning rate scheduler')
++    parser.add_argument('--lr_patience', type=int, default=5,
++                        help='Epochs with no improvement before reducing LR')
++    parser.add_argument('--lr_factor', type=float, default=0.1,
++                        help='Factor for ReduceLROnPlateau')
++    parser.add_argument('--early_stop_patience', type=int, default=None,
++                        help='Patience for early stopping (auto mode sets 2×lr_patience if omitted)')
+     parser.add_argument('--resume', type=str, default=None,
+                         help='Path to checkpoint to resume from')
+     parser.add_argument('--checkpoint', type=str, default=None,
+                         help='Path to checkpoint for inference mode')
+     parser.add_argument('--image', type=str, default=None,
+                         help='Path to image for inference mode')
++    parser.add_argument('--profile', action='store_true',
++                        help='Profile data loading and model to find bottlenecks')
+     
+     args = parser.parse_args()
+     
+     if args.mode == 'cache':
+         # Create SSD cache for 2048×2048 images
+         cache = SSDImageCache()
+         cache.create_full_cache(args.data_dir)
+         print("Cache creation completed!")
+         
+     elif args.mode == 'train':
+         # Create checkpoint directory
+         checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+         os.makedirs(checkpoint_dir, exist_ok=True)
+         print(f"Using checkpoint directory: {checkpoint_dir}")
+         
+         # Build train/val splits
+         set_seed(42, deterministic=True)
+         
+         # Load or create train/val split lists
+         split_file = os.path.join(args.checkpoint_dir, 'train_val_split.json')
+         if os.path.exists(split_file):
+             with open(split_file, 'r') as f:
+                 split_data = json.load(f)
+             train_files, val_files = split_data['train_files'], split_data['val_files']
+             print(f"✅ Loaded existing split: {len(train_files)} train, {len(val_files)} val")
+         else:
+             # Create new split
+             train_files, val_files = build_grouped_split_files(
+                 args.data_dir, 
+                 seed=42, 
+                 val_frac=0.15,
+             )
+             # Save split for consistency across runs
+             with open(split_file, 'w') as f:
+                 json.dump({
+                     'train_files': train_files,
+                     'val_files': val_files,
+                     'seed': 42,
+                     'val_frac': 0.15
+                 }, f, indent=2)
+             print(f"✅ Created and saved new split: {len(train_files)} train, {len(val_files)} val")
+         
+         # Create datasets using SSD cache
+         train_dataset = HighResSpotBallDataset(args.data_dir, train_files)
+         val_dataset = HighResSpotBallDataset(args.data_dir, val_files)
+         
+         # Create data loaders with memory-efficient settings
+         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
+                                 num_workers=4, pin_memory=True, persistent_workers=True,
+                                 prefetch_factor=2)
+-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
+-                              num_workers=4, pin_memory=True, persistent_workers=True,
+-                              prefetch_factor=2)
+-        
++        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
++                               num_workers=4, pin_memory=True, persistent_workers=True,
++                               prefetch_factor=2)
++
+         # Create model
+         model = ConvNeXtSpotModel(pretrained=True)
+-        
++
++        if args.profile:
++            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++            profile_bottlenecks(model, train_loader, device)
++
+         # Optional torch.compile for performance (commented out for compatibility)
+         # if torch.cuda.is_available():
+         #     model = torch.compile(model, mode='reduce-overhead')
+         
+         
+         # Load checkpoint if resuming
+         start_epoch = 0
+         optimizer_state = None
+         scheduler_state = None
+         
+         if args.resume:
+             # Handle both absolute and relative paths
+             checkpoint_path = args.resume
+             if not os.path.isabs(checkpoint_path):
+                 checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_path)
+             
+             if os.path.exists(checkpoint_path):
+                 print(f"Loading checkpoint from {checkpoint_path}")
+                 try:
+                     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                     model.load_state_dict(checkpoint['model_state_dict'])
+                     start_epoch = checkpoint.get('epoch', 0) + 1
+                     optimizer_state = checkpoint.get('optimizer_state_dict', None)
+                     scheduler_state = checkpoint.get('scheduler_state_dict', None)
+                     print(f"✅ Resuming training from epoch {start_epoch}")
+                     print(f"   - Last saved epoch: {checkpoint.get('epoch', 0)}")
+                     print(f"   - Best validation error: {checkpoint.get('best_val_error', 'N/A')}")
+                 except Exception as e:
+                     print(f"❌ Error loading checkpoint: {e}")
+                     print("🔄 Starting training from epoch 0 instead")
+                     start_epoch = 0
+                     optimizer_state = None
+                     scheduler_state = None
+             else:
+                 print(f"❌ Checkpoint file not found: {checkpoint_path}")
+                 print("🔄 Starting training from epoch 0")
+         else:
+             print("🔄 Starting training from epoch 0 (no resume specified)")
+ 
+         # Train model
+         model, history = train_model(
+-            model, train_loader, val_loader, 
+-            num_epochs=args.epochs, 
++            model, train_loader, val_loader,
++            num_epochs=args.epochs,
+             learning_rate=args.learning_rate,
+             checkpoint_dir=args.checkpoint_dir,
+             start_epoch=start_epoch,
+             optimizer_state=optimizer_state,
+-            scheduler_state=scheduler_state
++            scheduler_state=scheduler_state,
++            scheduler_type=args.scheduler,
++            lr_factor=args.lr_factor,
++            lr_patience=args.lr_patience,
++            early_stop_patience=args.early_stop_patience,
+         )
+         
+         print("Training completed!")
+ 
+     elif args.mode == 'inference':
+         # Inference mode
+         if not args.image:
+             print("Error: --image is required for inference mode")
+             return
+             
+         checkpoint_path = args.checkpoint if args.checkpoint else 'checkpoint_best.pth'
+         if not os.path.exists(checkpoint_path):
+             print(f"Error: Checkpoint file not found: {checkpoint_path}")
+             return
+             
+         print("Running inference...")
+         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+         
+         # Load model
+         model = ConvNeXtSpotModel(pretrained=False)
+         checkpoint = torch.load(checkpoint_path, map_location=device)
+         model.load_state_dict(checkpoint['model_state_dict'])
+         model.eval()
+         
+         # Create dataset for single image
+ 
+EOF
+)import os
 import re
 import numpy as np
 import torch
