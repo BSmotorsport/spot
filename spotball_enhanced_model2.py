@@ -246,6 +246,8 @@ def create_gaussian_heatmap(coords_norm, heatmap_size=HEATMAP_SIZE, sigma=2.0):
 
     heatmap[y, x] = 1.0
     heatmap = gaussian_filter(heatmap, sigma=sigma)
+    heatmap /= heatmap.max()
+    # Normalizing preserves a sharp peak for stable training
 
     return heatmap
 
