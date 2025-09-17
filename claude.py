@@ -149,11 +149,13 @@ def soft_argmax_2d(heatmap, temperature=1.0):
     # Create coordinate grids normalized to [0, 1]
     x_coords = torch.linspace(0, 1, width, device=heatmap.device, dtype=torch.float32)
     y_coords = torch.linspace(0, 1, height, device=heatmap.device, dtype=torch.float32)
-    xx, yy = torch.meshgrid(x_coords, y_coords, indexing='xy')
-    
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    xx = xx.unsqueeze(0).unsqueeze(0)
+    yy = yy.unsqueeze(0).unsqueeze(0)
+
     # Compute expected coordinates
-    x_expected = torch.sum(heatmap_probs * xx.unsqueeze(0).unsqueeze(0), dim=(2, 3))
-    y_expected = torch.sum(heatmap_probs * yy.unsqueeze(0).unsqueeze(0), dim=(2, 3))
+    x_expected = torch.sum(heatmap_probs * xx, dim=(2, 3))
+    y_expected = torch.sum(heatmap_probs * yy, dim=(2, 3))
     
     coords = torch.stack([x_expected.squeeze(1), y_expected.squeeze(1)], dim=1)
     
