@@ -433,11 +433,19 @@ def create_model(pretrained=True):
             def __init__(self, backbone):
                 super().__init__()
                 self.backbone = backbone
-            
+
             def forward(self, x):
                 features = self.backbone(x)
                 return [features]  # Return as list to match timm interface
-        
+
+            def train(self, mode: bool = True):
+                super().train(mode)
+                self.backbone.train(mode)
+                return self
+
+            def eval(self):
+                return self.train(False)
+
         backbone = ResNetBackbone(backbone)
         
         # Get feature dimensions
@@ -505,6 +513,8 @@ def create_model(pretrained=True):
 def train_one_epoch(model, dataloader, optimizer, criterion, device, scaler, epoch):
     """Train for one epoch with mixed precision."""
     model.train()
+    if not any(param.requires_grad for param in model.backbone.parameters()):
+        model.backbone.eval()
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_coord_loss = 0.0
@@ -918,6 +928,7 @@ def main():
     print("\n🔒 Stage 1: Freezing backbone, training head only")
     for param in model.backbone.parameters():
         param.requires_grad = False
+    model.backbone.eval()
     
     # -------------------------------------------------------------------------
     # 6. Optional: Run learning rate finder
@@ -985,6 +996,7 @@ def main():
             print(f"Model was already unfrozen at checkpoint, unfreezing all layers")
             for param in model.parameters():
                 param.requires_grad = True
+            model.backbone.train()
             optimizer = optim.AdamW(
                 model.parameters(),
                 lr=Config.FINETUNE_LR,
@@ -996,6 +1008,7 @@ def main():
         else:
             # Original frozen state
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            model.backbone.eval()
         
         print(f"Resumed from epoch {start_epoch}")
     
@@ -1010,11 +1023,12 @@ def main():
             print("\n" + "="*80)
             print(f"🔓 Epoch {epoch+1}: Unfreezing all layers for fine-tuning")
             print("="*80 + "\n")
-            
+
             # Unfreeze all parameters
             for param in model.parameters():
                 param.requires_grad = True
-            
+            model.backbone.train()
+
             # Create new optimizer with all parameters
             optimizer = optim.AdamW(
                 model.parameters(),
