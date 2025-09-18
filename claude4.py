@@ -387,100 +387,123 @@ def create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch):
 # ======================================================================================
 
 class HeatmapHead(nn.Module):
-    """Decoder head for heatmap generation with skip connections."""
-    def __init__(self, in_features, spatial_size=24, dropout_rate=0.1):
+    """FPN-style decoder head for multi-scale feature fusion."""
+
+    def __init__(self, in_channels_list, spatial_sizes, dropout_rate=0.1):
         super().__init__()
-        self.spatial_size = spatial_size
-        self.in_features = in_features
+        if not isinstance(in_channels_list, (list, tuple)):
+            raise ValueError("in_channels_list must be a list or tuple of channel dimensions")
 
-        # Calculate upsampling factor needed
-        # From spatial_size to Config.HEATMAP_SIZE (384)
-        self.scale_factor = Config.HEATMAP_SIZE // spatial_size
+        if not isinstance(spatial_sizes, (list, tuple)):
+            raise ValueError("spatial_sizes must be provided for each feature level")
 
-        # Adjust channels based on input features
-        mid_channels = min(512, in_features // 2)
+        if len(in_channels_list) != len(spatial_sizes):
+            raise ValueError("in_channels_list and spatial_sizes must have the same length")
 
-        half_channels = max(mid_channels // 2, 128)
-        quarter_channels = max(half_channels // 2, 64)
+        self.in_channels_list = list(in_channels_list)
+        self.spatial_sizes = list(spatial_sizes)
+        self.num_scales = len(self.in_channels_list)
 
-        # Progressive upsampling decoder with GroupNorm for small batches
-        self.decoder = nn.Sequential(
-            nn.Conv2d(in_features, mid_channels, kernel_size=3, padding=1, bias=False),
-            _make_group_norm(mid_channels),
-            nn.GELU(),
-            nn.Dropout2d(dropout_rate),
+        # Normalize all feature maps to a shared channel width for fusion
+        self.fpn_channels = min(256, max(self.in_channels_list))
 
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(mid_channels, half_channels, kernel_size=3, padding=1, bias=False),
-            _make_group_norm(half_channels),
-            nn.GELU(),
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(channels, self.fpn_channels, kernel_size=1)
+            for channels in self.in_channels_list
+        ])
 
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(half_channels, quarter_channels, kernel_size=3, padding=1, bias=False),
-            _make_group_norm(quarter_channels),
-            nn.GELU(),
+        self.output_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(self.fpn_channels, self.fpn_channels, kernel_size=3, padding=1, bias=False),
+                _make_group_norm(self.fpn_channels),
+                nn.GELU(),
+            )
+            for _ in self.in_channels_list
+        ])
 
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(quarter_channels, 64, kernel_size=3, padding=1, bias=False),
-            _make_group_norm(64),
-            nn.GELU(),
+        highest_resolution = self.spatial_sizes[0]
+        self.decoder = self._build_decoder(highest_resolution, dropout_rate)
 
-            nn.Conv2d(64, 1, kernel_size=1)
-        )
-        
-        # Coordinate regression head
+        # Coordinate regression uses the deepest semantic feature
+        self.coord_proj = nn.Conv2d(self.in_channels_list[-1], self.fpn_channels, kernel_size=1)
         self.coord_regressor = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(in_features, 512),
+            nn.Linear(self.fpn_channels, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout_rate),
             nn.Linear(512, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, 2)  # Output x, y coordinates
+            nn.Linear(256, 2),
         )
-    
-    def forward(self, x):
-        # Store original shape for coord regression
-        orig_x = x
-        
-        # Reshape if necessary (from patches to spatial)
-        if len(x.shape) == 3:  # (B, H*W, C)
-            B, L, C = x.shape
-            H = W = int(np.sqrt(L))
-            x = x.transpose(1, 2).view(B, C, H, W)
-        elif len(x.shape) == 4:
-            # Already in (B, C, H, W) format
-            B, C, H, W = x.shape
-        else:
-            raise ValueError(f"Unexpected input shape: {x.shape}")
-        
-        # Generate heatmap
-        heatmap = self.decoder(x)
-        
-        # Ensure heatmap is the correct size
+
+    def _build_decoder(self, base_spatial_size, dropout_rate):
+        layers = [
+            nn.Conv2d(self.fpn_channels, self.fpn_channels, kernel_size=3, padding=1, bias=False),
+            _make_group_norm(self.fpn_channels),
+            nn.GELU(),
+            nn.Dropout2d(dropout_rate),
+        ]
+
+        current_channels = self.fpn_channels
+        current_size = base_spatial_size
+
+        while current_size < Config.HEATMAP_SIZE:
+            next_channels = max(current_channels // 2, 64)
+            layers.extend([
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(current_channels, next_channels, kernel_size=3, padding=1, bias=False),
+                _make_group_norm(next_channels),
+                nn.GELU(),
+            ])
+            current_channels = next_channels
+            current_size *= 2
+
+        layers.append(nn.Conv2d(current_channels, 1, kernel_size=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, features):
+        if not isinstance(features, (list, tuple)):
+            raise ValueError("HeatmapHead expects a list or tuple of backbone features")
+
+        if len(features) != self.num_scales:
+            raise ValueError(
+                f"Expected {self.num_scales} feature maps but received {len(features)}"
+            )
+
+        fpn_results = [None] * self.num_scales
+        prev_feature = None
+        for idx in reversed(range(self.num_scales)):
+            lateral = self.lateral_convs[idx](features[idx])
+            if prev_feature is not None:
+                prev_feature = F.interpolate(
+                    prev_feature,
+                    size=lateral.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                lateral = lateral + prev_feature
+
+            smoothed = self.output_convs[idx](lateral)
+            fpn_results[idx] = smoothed
+            prev_feature = smoothed
+
+        fused_high_res = fpn_results[0]
+        heatmap = self.decoder(fused_high_res)
+
         if heatmap.shape[-1] != Config.HEATMAP_SIZE:
             heatmap = F.interpolate(
-                heatmap, 
+                heatmap,
                 size=(Config.HEATMAP_SIZE, Config.HEATMAP_SIZE),
                 mode='bilinear',
-                align_corners=False
+                align_corners=False,
             )
-        
-        # Predict coordinates directly for combined loss
-        # Use the original feature for coordinate regression
-        if len(orig_x.shape) == 3:
-            B, L, C = orig_x.shape
-            H = W = int(np.sqrt(L))
-            orig_x = orig_x.transpose(1, 2).view(B, C, H, W)
-        
-        coords_raw = self.coord_regressor(orig_x)
-        
-        # Apply sigmoid to bound coordinates to [0, 1] then scale to image size
-        # This ensures coordinates are always in valid range
+
+        deepest_feature = self.coord_proj(features[-1])
+        coords_raw = self.coord_regressor(deepest_feature)
         coords = torch.sigmoid(coords_raw) * Config.IMAGE_SIZE
-        
+
         return heatmap, coords
 
 class FullModel(nn.Module):
@@ -489,42 +512,46 @@ class FullModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.head = head
-    
+
     def forward(self, x):
         features = self.backbone(x)
-        # Use the last feature map
-        last_features = features[-1] if isinstance(features, list) else features
-        heatmap, coords = self.head(last_features)
+        if not isinstance(features, (list, tuple)):
+            features = [features]
+        heatmap, coords = self.head(features)
         return heatmap, coords
 
 def create_model(pretrained=True):
     """Create the full model with proper initialization."""
     print(f"Creating model: {Config.MODEL_NAME}")
-    
+
     # Use timm for ConvNeXt
     backbone = timm.create_model(
         Config.MODEL_NAME,
         pretrained=pretrained,
         features_only=True,
-        out_indices=[-1]  # Get only the last feature map
+        out_indices=(0, 1, 2, 3)  # Expose multiple stages for multi-scale fusion
     )
-    
+
     # Get feature dimensions
     dummy_input = torch.randn(1, 3, Config.IMAGE_SIZE, Config.IMAGE_SIZE)
     with torch.no_grad():
         features = backbone(dummy_input)
-        if isinstance(features, list):
-            in_features = features[-1].shape[1]
-            spatial_size = features[-1].shape[2]
-        else:
-            in_features = features.shape[1]
-            spatial_size = features.shape[2]
-    
-    print(f"Backbone output: {in_features} channels, {spatial_size}x{spatial_size} spatial")
-    
-    # Create head with correct spatial size
-    head = HeatmapHead(in_features, spatial_size=spatial_size)
-    
+        if not isinstance(features, (list, tuple)):
+            features = [features]
+
+        in_channels_list = [feat.shape[1] for feat in features]
+        spatial_sizes = [feat.shape[2] for feat in features]
+
+    print(
+        "Backbone outputs: "
+        + ", ".join(
+            f"{c}ch @ {s}x{s}" for c, s in zip(in_channels_list, spatial_sizes)
+        )
+    )
+
+    # Create head with multi-scale information
+    head = HeatmapHead(in_channels_list=in_channels_list, spatial_sizes=spatial_sizes)
+
     # Combine into full model
     model = FullModel(backbone, head)
     
