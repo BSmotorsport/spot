@@ -981,12 +981,56 @@ def main():
     if os.path.exists(checkpoint_path):
         print(f"\n📂 Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=Config.DEVICE)
-        model.load_state_dict(checkpoint['model_state_dict'])
+
+        def _load_model_weights(model, checkpoint_state):
+            """Load checkpoint weights that match the current architecture."""
+            model_state = model.state_dict()
+            compatible_state = {}
+            skipped_keys = []
+
+            for key, value in checkpoint_state.items():
+                if key not in model_state:
+                    skipped_keys.append((key, "missing in current model"))
+                    continue
+
+                if model_state[key].shape != value.shape:
+                    skipped_keys.append((key, f"shape mismatch {value.shape} vs {model_state[key].shape}"))
+                    continue
+
+                compatible_state[key] = value
+
+            load_result = model.load_state_dict(compatible_state, strict=False)
+
+            if skipped_keys:
+                print("\n⚠️ Some checkpoint weights were not loaded due to architecture changes:")
+                for key, reason in skipped_keys:
+                    print(f"   • {key}: {reason}")
+
+            if load_result.missing_keys:
+                print("\nℹ️ Newly initialized parameters:")
+                for key in load_result.missing_keys:
+                    print(f"   • {key}")
+
+            if load_result.unexpected_keys:
+                print("\nℹ️ Unused checkpoint parameters:")
+                for key in load_result.unexpected_keys:
+                    print(f"   • {key}")
+
+        _load_model_weights(model, checkpoint['model_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_mae = checkpoint.get('best_val_mae', float('inf'))
         best_val_rmse = checkpoint.get('best_val_rmse', float('inf'))
         if 'history' in checkpoint:
             history = checkpoint['history']
+
+        def _safe_load_optimizer(opt, opt_state):
+            if not opt_state:
+                return
+            try:
+                opt.load_state_dict(opt_state)
+            except (ValueError, RuntimeError) as err:
+                print("\n⚠️ Optimizer state could not be fully restored and will be reinitialized:")
+                print(f"   • {err}")
 
         # Check if we should unfreeze based on epoch
         if start_epoch > Config.UNFREEZE_EPOCH:
@@ -999,26 +1043,40 @@ def main():
                 weight_decay=Config.WEIGHT_DECAY,
                 eps=1e-8
             )
-            # Now load optimizer state after creating with all parameters
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            _safe_load_optimizer(optimizer, checkpoint.get('optimizer_state_dict'))
         else:
             # Original frozen state
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            _safe_load_optimizer(optimizer, checkpoint.get('optimizer_state_dict'))
 
         print(f"Resumed from epoch {start_epoch}")
 
         scheduler_state = checkpoint.get('scheduler_state_dict')
+        scheduler_remaining_epochs = 0
         if start_epoch > Config.UNFREEZE_EPOCH:
-            remaining_epochs = max(Config.EPOCHS - start_epoch, 0)
-            scheduler = create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch) if remaining_epochs > 0 else None
+            scheduler_remaining_epochs = max(Config.EPOCHS - start_epoch, 0)
+            if scheduler_remaining_epochs > 0:
+                scheduler = create_warmup_scheduler(optimizer, scheduler_remaining_epochs, updates_per_epoch)
+            else:
+                scheduler = None
         elif start_epoch < Config.UNFREEZE_EPOCH:
-            remaining_epochs = max(Config.UNFREEZE_EPOCH - start_epoch, 0)
-            scheduler = create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch) if remaining_epochs > 0 else None
+            scheduler_remaining_epochs = max(Config.UNFREEZE_EPOCH - start_epoch, 0)
+            if scheduler_remaining_epochs > 0:
+                scheduler = create_warmup_scheduler(optimizer, scheduler_remaining_epochs, updates_per_epoch)
+            else:
+                scheduler = None
         else:
             scheduler = None
 
         if scheduler is not None and scheduler_state is not None:
-            scheduler.load_state_dict(scheduler_state)
+            try:
+                scheduler.load_state_dict(scheduler_state)
+            except (ValueError, RuntimeError) as err:
+                print("\n⚠️ Scheduler state could not be restored and will be reinitialized:")
+                print(f"   • {err}")
+                if scheduler_remaining_epochs > 0:
+                    scheduler = create_warmup_scheduler(optimizer, scheduler_remaining_epochs, updates_per_epoch)
+                else:
+                    scheduler = None
 
     if scheduler is None:
         if start_epoch < Config.UNFREEZE_EPOCH:
