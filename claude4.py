@@ -3,14 +3,15 @@
 import os
 import random
 import re
+import math
 from collections import defaultdict
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import torchvision.models as models
 import timm
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -18,9 +19,6 @@ import cv2
 from sklearn.model_selection import train_test_split
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
-import csv
-import pandas as pd
 from torch.amp import GradScaler, autocast
 
 # ======================================================================================
@@ -41,13 +39,16 @@ class Config:
     MODEL_NAME = 'convnext_base.fb_in22k_ft_in1k'  # ConvNeXt Base model
     BATCH_SIZE = 2  # ConvNeXt needs more memory
     EPOCHS = 250
-    INITIAL_LR = 3e-5
-    FINETUNE_LR = 1e-6
+    INITIAL_LR = 3e-4
+    FINETUNE_LR = 3e-5
     UNFREEZE_EPOCH = 10
     WEIGHT_DECAY = 1e-5
     NUM_WORKERS = 4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     RANDOM_SEED = 42
+    WARMUP_EPOCHS = 1
+    GRAD_ACCUM_STEPS = 4
+    MIN_LR_FACTOR = 0.1
     
     # Loss settings
     WING_W = 5.0
@@ -106,24 +107,26 @@ def parse_filename(filename):
         return None
 
 def mixup_data(images, heatmaps, coords, alpha=0.2):
-    """Apply mixup augmentation to images, heatmaps, and coordinates."""
+    """Apply mixup augmentation and return paired targets for correct loss blending."""
     if alpha > 0:
         batch_size = images.size(0)
-        indices = torch.randperm(batch_size).to(images.device)
-        
+        indices = torch.randperm(batch_size, device=images.device)
+
         lambda_ = np.random.beta(alpha, alpha)
-        lambda_ = max(lambda_, 1-lambda_)  # Ensure stronger image gets more weight
-        
-        # Mix images
+        lambda_ = max(lambda_, 1 - lambda_)
+
         mixed_images = lambda_ * images + (1 - lambda_) * images[indices]
-        
-        # Mix heatmaps (these correspond spatially to the mixed images)
-        mixed_heatmaps = lambda_ * heatmaps + (1 - lambda_) * heatmaps[indices]
-        
-        # For coordinates, we return both sets for proper loss calculation
-        return mixed_images, mixed_heatmaps, coords, coords[indices], lambda_
-    
-    return images, heatmaps, coords, None, 1.0
+
+        return (
+            mixed_images,
+            heatmaps,
+            heatmaps[indices],
+            coords,
+            coords[indices],
+            lambda_,
+        )
+
+    return images, heatmaps, None, coords, None, 1.0
 
 def create_target_heatmap(keypoints, size, sigma=None):
     """Create Gaussian heatmap for keypoints with proper normalization."""
@@ -287,21 +290,97 @@ class CombinedLoss(nn.Module):
     """Combined loss for heatmap and coordinate regression."""
     def __init__(self, heatmap_weight=0.7, coord_weight=0.3):
         super().__init__()
-        # Use MSE for more stable training initially
-        self.heatmap_loss = nn.MSELoss()
+        # Use BCE with logits to preserve gradients on sparse heatmaps
+        self.heatmap_loss = nn.BCEWithLogitsLoss()
         # Keep SmoothL1 for coordinates
         self.coord_loss = nn.SmoothL1Loss()
         self.heatmap_weight = heatmap_weight
         self.coord_weight = coord_weight
-    
+
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         h_loss = self.heatmap_loss(pred_heatmaps, target_heatmaps)
-        
+
         if pred_coords is not None and target_coords is not None:
             c_loss = self.coord_loss(pred_coords, target_coords)
             return self.heatmap_weight * h_loss + self.coord_weight * c_loss, h_loss, c_loss
-        
+
         return h_loss, h_loss, torch.tensor(0.0)
+
+
+def _make_group_norm(num_channels, max_groups=32):
+    """Create a GroupNorm layer with the largest group size that divides the channels."""
+    for groups in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % groups == 0:
+            return nn.GroupNorm(groups, num_channels)
+    return nn.GroupNorm(1, num_channels)
+
+
+class WarmupCosineLR:
+    """Lightweight warmup + cosine scheduler stepped per optimizer update."""
+
+    def __init__(self, optimizer, total_steps, warmup_steps=0, min_lr_ratio=0.1):
+        self.optimizer = optimizer
+        self.total_steps = max(int(total_steps), 1)
+        self.warmup_steps = int(min(warmup_steps, self.total_steps))
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        self.min_lrs = [lr * min_lr_ratio for lr in self.base_lrs]
+        self.step_num = 0
+        self.last_lrs = self.base_lrs.copy()
+
+    def step(self):
+        self.step_num = min(self.step_num + 1, self.total_steps)
+        self.last_lrs = []
+        for base_lr, min_lr, group in zip(self.base_lrs, self.min_lrs, self.optimizer.param_groups):
+            if self.step_num <= self.warmup_steps and self.warmup_steps > 0:
+                lr = base_lr * (self.step_num / max(1, self.warmup_steps))
+            else:
+                progress = 0.0
+                if self.total_steps > self.warmup_steps:
+                    progress = (self.step_num - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+                cosine = 0.5 * (1 + math.cos(math.pi * progress))
+                lr = min_lr + (base_lr - min_lr) * cosine
+            group['lr'] = lr
+            self.last_lrs.append(lr)
+        return self.last_lrs
+
+    def get_last_lr(self):
+        return self.last_lrs
+
+    def state_dict(self):
+        return {
+            'step_num': self.step_num,
+            'total_steps': self.total_steps,
+            'warmup_steps': self.warmup_steps,
+            'base_lrs': self.base_lrs,
+            'min_lrs': self.min_lrs,
+            'last_lrs': self.last_lrs,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.step_num = state_dict['step_num']
+        self.total_steps = state_dict['total_steps']
+        self.warmup_steps = state_dict['warmup_steps']
+        self.base_lrs = state_dict['base_lrs']
+        self.min_lrs = state_dict['min_lrs']
+        self.last_lrs = state_dict['last_lrs']
+        self._apply_current_lrs()
+
+    def _apply_current_lrs(self):
+        # Reapply stored LR values to optimizer parameter groups
+        for lr, group in zip(self.last_lrs, self.optimizer.param_groups):
+            group['lr'] = lr
+
+
+def create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch):
+    """Utility to build a warmup cosine scheduler for the given training horizon."""
+    total_steps = int(max(remaining_epochs * updates_per_epoch, 1))
+    warmup_steps = int(min(Config.WARMUP_EPOCHS * updates_per_epoch, total_steps))
+    return WarmupCosineLR(
+        optimizer,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        min_lr_ratio=Config.MIN_LR_FACTOR,
+    )
 
 # ======================================================================================
 # 5. MODEL ARCHITECTURE
@@ -313,49 +392,40 @@ class HeatmapHead(nn.Module):
         super().__init__()
         self.spatial_size = spatial_size
         self.in_features = in_features
-        
+
         # Calculate upsampling factor needed
         # From spatial_size to Config.HEATMAP_SIZE (384)
         self.scale_factor = Config.HEATMAP_SIZE // spatial_size
-        
+
         # Adjust channels based on input features
         mid_channels = min(512, in_features // 2)
-        
-        # Progressive upsampling decoder
+
+        half_channels = max(mid_channels // 2, 128)
+        quarter_channels = max(half_channels // 2, 64)
+
+        # Progressive upsampling decoder with GroupNorm for small batches
         self.decoder = nn.Sequential(
-            # Initial projection
             nn.Conv2d(in_features, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
+            _make_group_norm(mid_channels),
+            nn.GELU(),
             nn.Dropout2d(dropout_rate),
-            
-            # Upsample by 2x
+
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(mid_channels, mid_channels//2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels//2),
-            nn.ReLU(inplace=True),
-            
-            # Upsample by 2x
+            nn.Conv2d(mid_channels, half_channels, kernel_size=3, padding=1, bias=False),
+            _make_group_norm(half_channels),
+            nn.GELU(),
+
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(mid_channels//2, mid_channels//4, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels//4),
-            nn.ReLU(inplace=True),
-            
-            # Upsample by 2x
+            nn.Conv2d(half_channels, quarter_channels, kernel_size=3, padding=1, bias=False),
+            _make_group_norm(quarter_channels),
+            nn.GELU(),
+
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(mid_channels//4, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            
-            # Upsample by 2x
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            
-            # Final heatmap generation
-            nn.Conv2d(32, 1, kernel_size=1)
-            # No sigmoid - let loss handle it
+            nn.Conv2d(quarter_channels, 64, kernel_size=3, padding=1, bias=False),
+            _make_group_norm(64),
+            nn.GELU(),
+
+            nn.Conv2d(64, 1, kernel_size=1)
         )
         
         # Coordinate regression head
@@ -462,7 +532,7 @@ def create_model(pretrained=True):
     for m in head.modules():
         if isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        elif isinstance(m, nn.BatchNorm2d):
+        elif isinstance(m, nn.GroupNorm):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
@@ -482,81 +552,94 @@ def create_model(pretrained=True):
 # 6. TRAINING FUNCTIONS
 # ======================================================================================
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, scaler, epoch, use_mixup=True):
-    """Train for one epoch with mixed precision and optional mixup."""
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    scaler,
+    epoch,
+    scheduler=None,
+    grad_accum_steps=1,
+    use_mixup=True,
+):
+    """Train for one epoch with mixed precision, mixup, and gradient accumulation."""
+
     model.train()
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_coord_loss = 0.0
-    
+
+    num_batches = len(dataloader)
+    optimizer.zero_grad(set_to_none=True)
+
     progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", colour="green")
-    
+
     for batch_idx, (images, target_heatmaps, target_coords) in enumerate(progress_bar):
         images = images.to(device)
         target_heatmaps = target_heatmaps.to(device)
         target_coords = target_coords.to(device)
-        
-        # Apply mixup augmentation if enabled
-        if use_mixup and np.random.rand() < 0.5:  # Apply mixup 50% of the time
-            images, target_heatmaps, coords_a, coords_b, lam = mixup_data(
-                images, target_heatmaps, target_coords, alpha=Config.MIXUP_ALPHA
-            )
+
+        if use_mixup and np.random.rand() < 0.5:
+            (
+                images,
+                target_a,
+                target_b,
+                coords_a,
+                coords_b,
+                lam,
+            ) = mixup_data(images, target_heatmaps, target_coords, alpha=Config.MIXUP_ALPHA)
         else:
+            target_a = target_heatmaps
+            target_b = None
             coords_a = target_coords
             coords_b = None
             lam = 1.0
-        
-        optimizer.zero_grad(set_to_none=True)
-        
-        # Mixed precision training
+
         with autocast(device_type='cuda' if device == 'cuda' else 'cpu', dtype=torch.float16):
             pred_heatmaps, pred_coords = model(images)
-            
-            # Calculate loss with mixup if applied
-            if coords_b is not None:
-                loss_a, h_loss_a, c_loss_a = criterion(
-                    pred_heatmaps, target_heatmaps,
-                    pred_coords, coords_a
-                )
-                loss_b, h_loss_b, c_loss_b = criterion(
-                    pred_heatmaps, target_heatmaps,
-                    pred_coords, coords_b
-                )
+
+            if target_b is not None and coords_b is not None:
+                loss_a, h_loss_a, c_loss_a = criterion(pred_heatmaps, target_a, pred_coords, coords_a)
+                loss_b, h_loss_b, c_loss_b = criterion(pred_heatmaps, target_b, pred_coords, coords_b)
                 loss = lam * loss_a + (1 - lam) * loss_b
                 h_loss = lam * h_loss_a + (1 - lam) * h_loss_b
                 c_loss = lam * c_loss_a + (1 - lam) * c_loss_b
             else:
-                loss, h_loss, c_loss = criterion(
-                    pred_heatmaps, target_heatmaps,
-                    pred_coords, target_coords
-                )
-        
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
-        
-        # Gradient clipping
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        scaler.step(optimizer)
-        scaler.update()
-        
-        # Update statistics
+                loss, h_loss, c_loss = criterion(pred_heatmaps, target_a, pred_coords, coords_a)
+
         total_loss += loss.item()
         total_heatmap_loss += h_loss.item()
         total_coord_loss += c_loss.item()
-        
-        # Update progress bar
-        progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'h_loss': f"{h_loss.item():.4f}",
-            'c_loss': f"{c_loss.item():.4f}"
-        })
-    
-    avg_loss = total_loss / len(dataloader)
-    avg_h_loss = total_heatmap_loss / len(dataloader)
-    avg_c_loss = total_coord_loss / len(dataloader)
-    
+
+        scaled_loss = loss / grad_accum_steps
+        scaler.scale(scaled_loss).backward()
+
+        should_step = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == num_batches
+        if should_step:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            if scheduler is not None:
+                scheduler.step()
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        progress_bar.set_postfix(
+            {
+                'loss': f"{loss.item():.4f}",
+                'h_loss': f"{h_loss.item():.4f}",
+                'c_loss': f"{c_loss.item():.4f}",
+            }
+        )
+
+    avg_loss = total_loss / num_batches
+    avg_h_loss = total_heatmap_loss / num_batches
+    avg_c_loss = total_coord_loss / num_batches
+
     return avg_loss, avg_h_loss, avg_c_loss
 
 def validate(model, dataloader, criterion, device, epoch):
@@ -796,7 +879,7 @@ def main():
         pin_memory=True,
         persistent_workers=Config.NUM_WORKERS > 0
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=Config.BATCH_SIZE,
@@ -805,8 +888,10 @@ def main():
         pin_memory=True,
         persistent_workers=Config.NUM_WORKERS > 0
     )
-    
+
     print(f"\n✅ Dataloaders created successfully")
+
+    updates_per_epoch = max(1, math.ceil(len(train_loader) / Config.GRAD_ACCUM_STEPS))
     
     # -------------------------------------------------------------------------
     # 4. Create model
@@ -836,16 +921,10 @@ def main():
         weight_decay=Config.WEIGHT_DECAY,
         eps=1e-8
     )
-    
+
     criterion = CombinedLoss(heatmap_weight=0.7, coord_weight=0.3)
-    
-    # Use CosineAnnealingWarmRestarts for intelligent LR scheduling
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=10,  # Initial restart period
-        T_mult=2,  # Factor to increase period after each restart
-        eta_min=1e-7  # Minimum learning rate
-    )
+
+    scheduler = None
     
     scaler = GradScaler()
     
@@ -876,7 +955,7 @@ def main():
         best_val_rmse = checkpoint.get('best_val_rmse', float('inf'))
         if 'history' in checkpoint:
             history = checkpoint['history']
-        
+
         # Check if we should unfreeze based on epoch
         if start_epoch > Config.UNFREEZE_EPOCH:
             print(f"Model was already unfrozen at checkpoint, unfreezing all layers")
@@ -893,9 +972,31 @@ def main():
         else:
             # Original frozen state
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
+
         print(f"Resumed from epoch {start_epoch}")
-    
+
+        scheduler_state = checkpoint.get('scheduler_state_dict')
+        if start_epoch > Config.UNFREEZE_EPOCH:
+            remaining_epochs = max(Config.EPOCHS - start_epoch, 0)
+            scheduler = create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch) if remaining_epochs > 0 else None
+        elif start_epoch < Config.UNFREEZE_EPOCH:
+            remaining_epochs = max(Config.UNFREEZE_EPOCH - start_epoch, 0)
+            scheduler = create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch) if remaining_epochs > 0 else None
+        else:
+            scheduler = None
+
+        if scheduler is not None and scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+
+    if scheduler is None:
+        if start_epoch < Config.UNFREEZE_EPOCH:
+            remaining_epochs = max(Config.UNFREEZE_EPOCH - start_epoch, 0)
+        else:
+            remaining_epochs = max(Config.EPOCHS - start_epoch, 0)
+
+        if remaining_epochs > 0:
+            scheduler = create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch)
+
     # -------------------------------------------------------------------------
     # 9. Main training loop
     # -------------------------------------------------------------------------
@@ -907,11 +1008,11 @@ def main():
             print("\n" + "="*80)
             print(f"🔓 Epoch {epoch+1}: Unfreezing all layers for fine-tuning")
             print("="*80 + "\n")
-            
+
             # Unfreeze all parameters
             for param in model.parameters():
                 param.requires_grad = True
-            
+
             # Create new optimizer with all parameters
             optimizer = optim.AdamW(
                 model.parameters(),
@@ -919,40 +1020,43 @@ def main():
                 weight_decay=Config.WEIGHT_DECAY,
                 eps=1e-8
             )
-            
-            # Reset scheduler with CosineAnnealingWarmRestarts
-            scheduler = CosineAnnealingWarmRestarts(
+
+            remaining_epochs = max(Config.EPOCHS - epoch, 0)
+            scheduler = create_warmup_scheduler(
                 optimizer,
-                T_0=10,
-                T_mult=2,
-                eta_min=1e-7
-            )
-        
+                remaining_epochs,
+                updates_per_epoch,
+            ) if remaining_epochs > 0 else None
+
         # Get current learning rate
-        current_lr = optimizer.param_groups[0]['lr']
         print(f"\n--- Epoch {epoch+1}/{Config.EPOCHS} ---")
-        print(f"Learning rate: {current_lr:.2e}")
-        
+        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+
         # Training phase
         train_loss, train_h_loss, train_c_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, Config.DEVICE, scaler, epoch
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            Config.DEVICE,
+            scaler,
+            epoch,
+            scheduler=scheduler,
+            grad_accum_steps=Config.GRAD_ACCUM_STEPS,
         )
-        
-        # Step the scheduler after each epoch
-        scheduler.step()
         
         # Validation phase
         if (epoch + 1) % Config.VALIDATE_EVERY_N_EPOCHS == 0:
             val_loss, val_mae, val_rmse, val_errors = validate(
                 model, val_loader, criterion, Config.DEVICE, epoch
             )
-            
+
             # Save metrics
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
             history['val_mae'].append(val_mae)
             history['val_rmse'].append(val_rmse)
-            history['lr'].append(current_lr)
+            history['lr'].append(optimizer.param_groups[0]['lr'])
             
             # Print epoch summary
             print(f"\n📊 Epoch {epoch+1} Summary:")
@@ -973,7 +1077,7 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'best_val_mae': best_val_mae,
                 'best_val_rmse': best_val_rmse,
                 'history': history
@@ -992,6 +1096,7 @@ def main():
                 print(f"  ✨ New best model saved! MAE: {best_val_mae:.2f} pixels")
         
         # Early stopping check
+        current_lr = optimizer.param_groups[0]['lr']
         if current_lr <= 1e-7 and epoch > Config.UNFREEZE_EPOCH + 10:
             print("\n⚠️ Learning rate too small, stopping training")
             break
