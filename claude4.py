@@ -726,6 +726,9 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
     
     # Combined prediction
     final_coords = 0.6 * heatmap_coords + 0.4 * pred_coords
+    # Move coords to CPU once for visualization to avoid device mismatches
+    final_coords_cpu = final_coords.detach().cpu()
+    target_coords_cpu = target_coords.detach().cpu()
     
     # Prepare figure
     num_samples = min(num_samples, len(images))
@@ -743,11 +746,13 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
         
         # Plot image with predictions
         axes[i, 0].imshow(img)
-        axes[i, 0].scatter(target_coords[i, 0].cpu(), target_coords[i, 1].cpu(), 
+        axes[i, 0].scatter(target_coords_cpu[i, 0], target_coords_cpu[i, 1],
                           c='green', s=100, marker='x', linewidths=3, label='GT')
-        axes[i, 0].scatter(final_coords[i, 0].cpu(), final_coords[i, 1].cpu(), 
+        axes[i, 0].scatter(final_coords_cpu[i, 0], final_coords_cpu[i, 1],
                           c='red', s=100, marker='+', linewidths=3, label='Pred')
-        axes[i, 0].set_title(f'Image {i+1}: Error={torch.dist(final_coords[i], target_coords[i].cpu()):.1f}px')
+        axes[i, 0].set_title(
+            f'Image {i+1}: Error={torch.dist(final_coords_cpu[i], target_coords_cpu[i]):.1f}px'
+        )
         axes[i, 0].legend()
         axes[i, 0].axis('off')
         
