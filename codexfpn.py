@@ -481,6 +481,7 @@ class HeatmapHead(nn.Module):
                 f"Expected {self.num_scales} feature maps but received {len(features)}"
             )
 
+
         def _ensure_contiguous(tensor: torch.Tensor) -> torch.Tensor:
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(
@@ -510,6 +511,7 @@ class HeatmapHead(nn.Module):
             smoothed = self.output_convs[idx](_ensure_contiguous(lateral))
             fpn_results[idx] = smoothed
             prev_feature = _ensure_contiguous(smoothed)
+
 
         fused_high_res = fpn_results[0]
         heatmap = self.decoder(fused_high_res)
