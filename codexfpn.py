@@ -35,7 +35,7 @@ class Config:
     ORIGINAL_WIDTH = 4416
     ORIGINAL_HEIGHT = 3336
     IMAGE_SIZE = 1536
-    HEATMAP_SIZE = 384
+    HEATMAP_SIZE = 256
     
     # Model settings - ACTUALLY USING CONVNEXT NOW
     MODEL_NAME = 'convnext_base.fb_in22k_ft_in1k'  # ConvNeXt Base model
@@ -43,7 +43,7 @@ class Config:
     EPOCHS = 250
     INITIAL_LR = 3e-4
     FINETUNE_LR = 3e-5
-    UNFREEZE_EPOCH = 10
+    UNFREEZE_EPOCH = 3
     WEIGHT_DECAY = 1e-5
     NUM_WORKERS = 4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -55,7 +55,7 @@ class Config:
     # Loss settings
     WING_W = 5.0
     WING_EPSILON = 0.5
-    HEATMAP_SIGMA = 6.0  # Broader Gaussian keeps gradients dense during early training
+    HEATMAP_SIGMA = 8.0  # Slightly broader Gaussian keeps gradients dense during early training
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
     HEATMAP_CONFIDENCE_THRESHOLD = 0.3  # Confidence needed before trusting heatmap coords
     HEATMAP_CONFIDENCE_POWER = 2.0  # Sharpen confidence curve for fusion weights
@@ -301,7 +301,11 @@ class FootballDataset(Dataset):
         ]
 
         # Create target heatmap
-        target_heatmap = create_target_heatmap(heatmap_keypoints, self.heatmap_size)
+        target_heatmap = create_target_heatmap(
+            heatmap_keypoints,
+            self.heatmap_size,
+            sigma=Config.HEATMAP_SIGMA,
+        )
 
         # Store precise coordinates for direct regression (normalized to [0, 1])
         precise_coords = torch.tensor(keypoints[0], dtype=torch.float32) / (Config.IMAGE_SIZE - 1)
@@ -336,32 +340,18 @@ class CombinedLoss(nn.Module):
         self.coord_loss = nn.SmoothL1Loss()
         self.heatmap_weight = heatmap_weight
         self.coord_weight = coord_weight
-        self._eps = 1e-6
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         device_type = pred_heatmaps.device.type
         with autocast(device_type=device_type, enabled=False):
+            pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
             target_heatmaps_fp32 = target_heatmaps.to(dtype=torch.float32)
 
-            threshold = 0.01
-            positive_count = (target_heatmaps_fp32 > threshold).float().sum()
-
-            if positive_count.item() <= 0.0:
-                pos_weight_value = 1.0
-            else:
-                total_elements = float(target_heatmaps_fp32.numel())
-                negative_count = max(total_elements - positive_count.item(), 0.0)
-                ratio = negative_count / (positive_count.item() + self._eps)
-                pos_weight_value = float(max(1.0, min(ratio, 10.0)))
-
-            pos_weight = pred_heatmaps.new_full((1,), pos_weight_value, dtype=torch.float32)
-
-            pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
-
-            h_loss = F.binary_cross_entropy_with_logits(
-                pred_heatmaps_fp32,
+            # Use a friendlier regression-style loss on probabilities so sparse targets
+            # still generate gradients early in training.
+            h_loss = F.mse_loss(
+                torch.sigmoid(pred_heatmaps_fp32),
                 target_heatmaps_fp32,
-                pos_weight=pos_weight,
             )
 
             if pred_coords is not None and target_coords is not None:
@@ -371,7 +361,7 @@ class CombinedLoss(nn.Module):
                 total_loss = self.heatmap_weight * h_loss + self.coord_weight * c_loss
             else:
                 c_loss = pred_heatmaps_fp32.new_tensor(0.0)
-                total_loss = h_loss
+                total_loss = self.heatmap_weight * h_loss
 
         return total_loss, h_loss, c_loss
 
@@ -449,6 +439,25 @@ def create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch):
         total_steps=total_steps,
         warmup_steps=warmup_steps,
         min_lr_ratio=Config.MIN_LR_FACTOR,
+    )
+
+
+def build_finetune_optimizer(model):
+    """Create an optimizer that decouples backbone and head learning rates."""
+    head_params = list(model.head.parameters())
+    head_param_ids = {id(p) for p in head_params}
+    backbone_params = [
+        p for p in model.parameters()
+        if id(p) not in head_param_ids
+    ]
+
+    return optim.AdamW(
+        [
+            {'params': backbone_params, 'lr': 1e-5},
+            {'params': head_params, 'lr': 1e-4},
+        ],
+        weight_decay=Config.WEIGHT_DECAY,
+        eps=1e-8,
     )
 
 # ======================================================================================
@@ -646,7 +655,7 @@ def create_model(pretrained=True):
     # Initialize weights for new layers
     for m in head.modules():
         if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.xavier_uniform_(m.weight, gain=1.0)
         elif isinstance(m, nn.GroupNorm):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
@@ -745,7 +754,10 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             if scheduler is not None:
-                scheduler.step()
+                current_lrs = scheduler.step()
+                if batch_idx == 0:
+                    pretty_lrs = ", ".join(f"{lr:.2e}" for lr in current_lrs)
+                    print(f"    Scheduler LRs after first step: {pretty_lrs}")
 
             scaler.step(optimizer)
             scaler.update()
@@ -775,6 +787,10 @@ def validate(model, dataloader, criterion, device, epoch):
     fusion_weight_log = []
     
     progress_bar = tqdm(dataloader, desc=f"Validation Epoch {epoch+1}", colour="yellow")
+
+    total_heatmap_abs_error = 0.0
+    total_regressor_abs_error = 0.0
+    total_coord_elems = 0
     
     with torch.no_grad():
         for images, target_heatmaps, target_coords in progress_bar:
@@ -805,6 +821,10 @@ def validate(model, dataloader, criterion, device, epoch):
 
             pred_coords_pixels = pred_coords.detach() * (Config.IMAGE_SIZE - 1)
             target_coords_pixels = target_coords.detach() * (Config.IMAGE_SIZE - 1)
+
+            total_heatmap_abs_error += torch.abs(heatmap_coords - target_coords_pixels).sum().item()
+            total_regressor_abs_error += torch.abs(pred_coords_pixels - target_coords_pixels).sum().item()
+            total_coord_elems += heatmap_coords.numel()
 
             fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
             fusion_weight_mean = fusion_weights.mean().item()
@@ -837,6 +857,14 @@ def validate(model, dataloader, criterion, device, epoch):
     
     # Calculate MAE and other metrics
     mae = torch.mean(torch.abs(all_preds - all_targets))
+    mae_heatmap = total_heatmap_abs_error / max(1, total_coord_elems)
+    mae_regressor = total_regressor_abs_error / max(1, total_coord_elems)
+
+    if epoch < 20:
+        print(
+            f"Branch MAE (epoch {epoch+1}): heatmap-only={mae_heatmap:.2f}px, "
+            f"regressor-only={mae_regressor:.2f}px"
+        )
     rmse = torch.sqrt(torch.mean((all_preds - all_targets)**2))
     
     # Calculate percentiles
@@ -986,6 +1014,12 @@ def main():
     # Print dataset statistics
     print(f"Total unique scenes: {len(scene_groups)}")
     print(f"Average images per scene: {len(valid_files) / len(scene_groups):.1f}")
+    preview_scenes = list(scene_groups.items())[:5]
+    if preview_scenes:
+        print("Scene preview (scene_id -> sample filenames):")
+        for scene_id, files in preview_scenes:
+            sample_files = [os.path.basename(f) for f in files[:3]]
+            print(f"  {scene_id}: {sample_files}")
     
     # Split by scenes to avoid data leakage
     scene_ids = list(scene_groups.keys())
@@ -1005,13 +1039,13 @@ def main():
     train_transform = A.Compose([
         A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
         A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=10, p=0.7, border_mode=cv2.BORDER_CONSTANT),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.3),
+        A.Rotate(limit=8, p=0.5, border_mode=cv2.BORDER_REFLECT_101),
+        A.RandomBrightnessContrast(0.2, 0.2, p=0.5),
+        A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.3),
         A.GaussNoise(p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
-    ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=True))
+    ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
     
     val_transform = A.Compose([
         A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
@@ -1170,12 +1204,7 @@ def main():
             print(f"Model was already unfrozen at checkpoint, unfreezing all layers")
             for param in model.parameters():
                 param.requires_grad = True
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=Config.FINETUNE_LR,
-                weight_decay=Config.WEIGHT_DECAY,
-                eps=1e-8
-            )
+            optimizer = build_finetune_optimizer(model)
             _safe_load_optimizer(optimizer, checkpoint.get('optimizer_state_dict'))
         else:
             # Original frozen state
@@ -1240,12 +1269,7 @@ def main():
                 torch.cuda.empty_cache()
 
             # Create new optimizer with all parameters
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=Config.FINETUNE_LR,
-                weight_decay=Config.WEIGHT_DECAY,
-                eps=1e-8
-            )
+            optimizer = build_finetune_optimizer(model)
 
             remaining_epochs = max(Config.EPOCHS - epoch, 0)
             scheduler = create_warmup_scheduler(
@@ -1256,7 +1280,10 @@ def main():
 
         # Get current learning rate
         print(f"\n--- Epoch {epoch+1}/{Config.EPOCHS} ---")
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+        lr_report = ", ".join(
+            f"group{i}:{group['lr']:.2e}" for i, group in enumerate(optimizer.param_groups)
+        )
+        print(f"Learning rates: {lr_report}")
 
         # Training phase
         train_loss, train_h_loss, train_c_loss = train_one_epoch(
@@ -1282,7 +1309,7 @@ def main():
             history['val_loss'].append(val_loss)
             history['val_mae'].append(val_mae)
             history['val_rmse'].append(val_rmse)
-            history['lr'].append(optimizer.param_groups[0]['lr'])
+            history['lr'].append([group['lr'] for group in optimizer.param_groups])
             
             # Print epoch summary
             print(f"\n📊 Epoch {epoch+1} Summary:")
@@ -1322,7 +1349,7 @@ def main():
                 print(f"  ✨ New best model saved! MAE: {best_val_mae:.2f} pixels")
         
         # Early stopping check
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = min(group['lr'] for group in optimizer.param_groups)
         if current_lr <= 1e-7 and epoch > Config.UNFREEZE_EPOCH + 10:
             print("\n⚠️ Learning rate too small, stopping training")
             break
