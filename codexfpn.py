@@ -212,9 +212,13 @@ def get_coords_from_heatmap(heatmap, method='soft_argmax'):
 def compute_heatmap_fusion_weight(heatmap_logits):
     """Estimate how much trust to place in the heatmap branch."""
     with torch.no_grad():
-        batch_size = heatmap_logits.size(0)
-        flattened = heatmap_logits.view(batch_size, -1)
+        logits = heatmap_logits.float()
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+
+        batch_size = logits.size(0)
+        flattened = logits.view(batch_size, -1)
         probs = torch.softmax(flattened, dim=1)
+        probs = torch.nan_to_num(probs, nan=0.0)
 
         topk = min(10, probs.size(1))
         topk_probs, _ = torch.topk(probs, k=topk, dim=1)
@@ -225,6 +229,7 @@ def compute_heatmap_fusion_weight(heatmap_logits):
         # extremely sharp, mean_topk << top1 and the confidence approaches 1. For
         # broad/ambiguous maps, top1 ~= mean_topk and the confidence approaches 0.
         confidence = 1.0 - (mean_topk / (top1 + 1e-8))
+        confidence = torch.nan_to_num(confidence, nan=0.0)
         confidence = confidence.clamp(min=0.0, max=1.0)
 
         if Config.HEATMAP_CONFIDENCE_POWER != 1.0:
@@ -334,46 +339,41 @@ class CombinedLoss(nn.Module):
         self._eps = 1e-6
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
-        target_heatmaps = target_heatmaps.to(dtype=pred_heatmaps.dtype)
+        device_type = pred_heatmaps.device.type
+        with autocast(device_type=device_type, enabled=False):
+            target_heatmaps_fp32 = target_heatmaps.to(dtype=torch.float32)
 
-        threshold = 0.01
-        positive_count = (target_heatmaps > threshold).float().sum()
+            threshold = 0.01
+            positive_count = (target_heatmaps_fp32 > threshold).float().sum()
 
-        if positive_count.item() <= 0.0:
-            pos_weight_value = 1.0
-        else:
-            total_elements = float(target_heatmaps.numel())
-            negative_count = max(total_elements - positive_count.item(), 0.0)
-            ratio = negative_count / (positive_count.item() + self._eps)
-            pos_weight_value = float(max(1.0, min(ratio, 10.0)))
+            if positive_count.item() <= 0.0:
+                pos_weight_value = 1.0
+            else:
+                total_elements = float(target_heatmaps_fp32.numel())
+                negative_count = max(total_elements - positive_count.item(), 0.0)
+                ratio = negative_count / (positive_count.item() + self._eps)
+                pos_weight_value = float(max(1.0, min(ratio, 10.0)))
 
-        # BCEWithLogitsLoss becomes numerically unstable in float16 when a
-        # non-unity ``pos_weight`` is used.  Once a few logits saturate the
-        # exponential in fp16 the gradients explode and the entire training
-        # run collapses to NaNs (which is exactly what we observed after a
-        # couple of epochs).  We therefore promote the logits/targets to
-        # float32 for the loss computation and then cast the result back so
-        # gradients still flow to the original tensor.
-        pos_weight = pred_heatmaps.new_full((1,), pos_weight_value, dtype=torch.float32)
+            pos_weight = pred_heatmaps.new_full((1,), pos_weight_value, dtype=torch.float32)
 
-        pred_heatmaps_fp32 = pred_heatmaps.float()
-        target_heatmaps_fp32 = target_heatmaps.float()
+            pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
 
-        h_loss = F.binary_cross_entropy_with_logits(
-            pred_heatmaps_fp32,
-            target_heatmaps_fp32,
-            pos_weight=pos_weight,
-        )
-        if pred_heatmaps.dtype != torch.float32:
-            h_loss = h_loss.to(pred_heatmaps.dtype)
+            h_loss = F.binary_cross_entropy_with_logits(
+                pred_heatmaps_fp32,
+                target_heatmaps_fp32,
+                pos_weight=pos_weight,
+            )
 
-        if pred_coords is not None and target_coords is not None:
-            c_loss = self.coord_loss(pred_coords, target_coords)
-            c_loss = c_loss.to(h_loss.dtype)
-            total_loss = self.heatmap_weight * h_loss + self.coord_weight * c_loss
-            return total_loss, h_loss, c_loss
+            if pred_coords is not None and target_coords is not None:
+                pred_coords_fp32 = pred_coords.to(dtype=torch.float32)
+                target_coords_fp32 = target_coords.to(dtype=torch.float32)
+                c_loss = self.coord_loss(pred_coords_fp32, target_coords_fp32)
+                total_loss = self.heatmap_weight * h_loss + self.coord_weight * c_loss
+            else:
+                c_loss = pred_heatmaps_fp32.new_tensor(0.0)
+                total_loss = h_loss
 
-        return h_loss, h_loss, pred_heatmaps.new_tensor(0.0, dtype=h_loss.dtype)
+        return total_loss, h_loss, c_loss
 
 
 def _make_group_norm(num_channels, max_groups=32):
@@ -725,6 +725,12 @@ def train_one_epoch(
                 c_loss = lam * c_loss_a + (1 - lam) * c_loss_b
             else:
                 loss, h_loss, c_loss = criterion(pred_heatmaps, target_a, pred_coords, coords_a)
+
+        if not torch.isfinite(loss):
+            print("\n⚠️ Non-finite loss encountered, skipping batch to protect training stability.")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
 
         total_loss += loss.item()
         total_heatmap_loss += h_loss.item()
@@ -1085,7 +1091,7 @@ def main():
 
     scheduler = None
     
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=(Config.DEVICE == "cuda"))
     
     # -------------------------------------------------------------------------
     # 7. Initialize tracking variables
