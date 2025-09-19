@@ -185,13 +185,15 @@ def soft_argmax_2d(heatmap, temperature=1.0):
     # Compute expected coordinates
     x_expected = torch.sum(heatmap_probs * xx, dim=(2, 3))
     y_expected = torch.sum(heatmap_probs * yy, dim=(2, 3))
-    
+
     coords = torch.stack([x_expected.squeeze(1), y_expected.squeeze(1)], dim=1)
-    
+
     # Scale back to pixel coordinates
-    coords[:, 0] *= width
-    coords[:, 1] *= height
-    
+    width_range = width - 1 if width > 1 else 0
+    height_range = height - 1 if height > 1 else 0
+    coords[:, 0] *= width_range
+    coords[:, 1] *= height_range
+
     return coords
 
 def get_coords_from_heatmap(heatmap, method='soft_argmax'):
@@ -282,18 +284,22 @@ class FootballDataset(Dataset):
             if not keypoints:
                 return self.__getitem__((idx + 1) % len(self))
         
+        if Config.IMAGE_SIZE <= 1 or self.heatmap_size <= 1:
+            raise ValueError("IMAGE_SIZE and heatmap_size must be greater than 1 for coordinate scaling")
+
+        image_to_heatmap = (self.heatmap_size - 1) / (Config.IMAGE_SIZE - 1)
         # Convert keypoints to heatmap space
         heatmap_keypoints = [
-            (kp[0] * (self.heatmap_size / Config.IMAGE_SIZE),
-             kp[1] * (self.heatmap_size / Config.IMAGE_SIZE))
+            (kp[0] * image_to_heatmap,
+             kp[1] * image_to_heatmap)
             for kp in keypoints
         ]
-        
+
         # Create target heatmap
         target_heatmap = create_target_heatmap(heatmap_keypoints, self.heatmap_size)
-        
+
         # Store precise coordinates for direct regression (normalized to [0, 1])
-        precise_coords = torch.tensor(keypoints[0], dtype=torch.float32) / Config.IMAGE_SIZE
+        precise_coords = torch.tensor(keypoints[0], dtype=torch.float32) / (Config.IMAGE_SIZE - 1)
         
         return image, torch.from_numpy(target_heatmap).unsqueeze(0), precise_coords
 
@@ -770,10 +776,15 @@ def validate(model, dataloader, criterion, device, epoch):
             
             # Extract coordinates from heatmap for evaluation
             heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
-            heatmap_coords = heatmap_coords * (Config.IMAGE_SIZE / Config.HEATMAP_SIZE)
 
-            pred_coords_pixels = pred_coords.detach() * Config.IMAGE_SIZE
-            target_coords_pixels = target_coords.detach() * Config.IMAGE_SIZE
+            if Config.HEATMAP_SIZE <= 1 or Config.IMAGE_SIZE <= 1:
+                raise ValueError("HEATMAP_SIZE and IMAGE_SIZE must be greater than 1 for coordinate scaling")
+
+            heatmap_to_image = (Config.IMAGE_SIZE - 1) / (Config.HEATMAP_SIZE - 1)
+            heatmap_coords = heatmap_coords * heatmap_to_image
+
+            pred_coords_pixels = pred_coords.detach() * (Config.IMAGE_SIZE - 1)
+            target_coords_pixels = target_coords.detach() * (Config.IMAGE_SIZE - 1)
 
             fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
             fusion_weight_mean = fusion_weights.mean().item()
@@ -835,10 +846,15 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
     
     # Extract coordinates from heatmap
     heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
-    heatmap_coords = heatmap_coords * (Config.IMAGE_SIZE / Config.HEATMAP_SIZE)
 
-    pred_coords_pixels = pred_coords * Config.IMAGE_SIZE
-    target_coords_pixels = target_coords * Config.IMAGE_SIZE
+    if Config.HEATMAP_SIZE <= 1 or Config.IMAGE_SIZE <= 1:
+        raise ValueError("HEATMAP_SIZE and IMAGE_SIZE must be greater than 1 for coordinate scaling")
+
+    heatmap_to_image = (Config.IMAGE_SIZE - 1) / (Config.HEATMAP_SIZE - 1)
+    heatmap_coords = heatmap_coords * heatmap_to_image
+
+    pred_coords_pixels = pred_coords * (Config.IMAGE_SIZE - 1)
+    target_coords_pixels = target_coords * (Config.IMAGE_SIZE - 1)
 
     fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
     fusion_weights = fusion_weights.unsqueeze(1)
