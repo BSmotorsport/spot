@@ -210,14 +210,24 @@ def get_coords_from_heatmap(heatmap, method='soft_argmax'):
 def compute_heatmap_fusion_weight(heatmap_logits):
     """Estimate how much trust to place in the heatmap branch."""
     with torch.no_grad():
-        probs = torch.sigmoid(heatmap_logits)
-        max_confidence = probs.view(probs.size(0), -1).max(dim=1).values
-        confidence = (max_confidence - Config.HEATMAP_CONFIDENCE_THRESHOLD) / (
-            1.0 - Config.HEATMAP_CONFIDENCE_THRESHOLD + 1e-6
-        )
+        batch_size = heatmap_logits.size(0)
+        flattened = heatmap_logits.view(batch_size, -1)
+        probs = torch.softmax(flattened, dim=1)
+
+        topk = min(10, probs.size(1))
+        topk_probs, _ = torch.topk(probs, k=topk, dim=1)
+        top1 = topk_probs[:, 0]
+        mean_topk = topk_probs.mean(dim=1)
+
+        # Convert the sharpness statistic into the [0, 1] range. When the peak is
+        # extremely sharp, mean_topk << top1 and the confidence approaches 1. For
+        # broad/ambiguous maps, top1 ~= mean_topk and the confidence approaches 0.
+        confidence = 1.0 - (mean_topk / (top1 + 1e-8))
         confidence = confidence.clamp(min=0.0, max=1.0)
+
         if Config.HEATMAP_CONFIDENCE_POWER != 1.0:
             confidence = confidence.pow(Config.HEATMAP_CONFIDENCE_POWER)
+
     return confidence
 
 # ======================================================================================
