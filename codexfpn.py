@@ -315,9 +315,13 @@ class CombinedLoss(nn.Module):
         # into logits. Clamping keeps the logit finite for blank background
         # pixels while still preserving a strong gradient for confident
         # foreground supervision.
+        # Perform the logit in float32 so the clamp margin remains representable
+        # under autocast. This avoids the 1.0 rounding that occurs for float16
+        # tensors when using very small epsilons, which previously produced
+        # inf/NaN targets.
         target_heatmaps = torch.logit(
-            target_heatmaps.clamp(self._target_eps, 1 - self._target_eps)
-        )
+            target_heatmaps.to(dtype=torch.float32).clamp(self._target_eps, 1 - self._target_eps)
+        ).to(dtype=pred_heatmaps.dtype)
 
         h_loss = self.heatmap_loss(pred_heatmaps, target_heatmaps)
 
