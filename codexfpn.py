@@ -472,22 +472,23 @@ class HeatmapHead(nn.Module):
                 f"Expected {self.num_scales} feature maps but received {len(features)}"
             )
 
+
+        def _ensure_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"Expected feature tensor but received {type(tensor)}"
+                )
+            return (
+                tensor
+                if tensor.is_contiguous(memory_format=torch.contiguous_format)
+                else tensor.contiguous()
+            )
+
         fpn_results = [None] * self.num_scales
         prev_feature = None
         for idx in reversed(range(self.num_scales)):
-            current_feature = features[idx]
+            current_feature = _ensure_contiguous(features[idx])
 
-            if not isinstance(current_feature, torch.Tensor):
-                raise TypeError(
-                    f"Expected feature tensor at index {idx} but received {type(current_feature)}"
-                )
-
-            # Ensure the tensor is in a contiguous memory format before using cuDNN kernels.
-            # During training the ConvNeXt backbone can emit channel-last tensors which
-            # occasionally trigger a BAD_PARAM_STREAM_MISMATCH error when fed directly into
-            # our standard convolution layers. Explicitly requesting contiguous memory keeps
-            # the activations in a layout that cuDNN's stream expectations handle reliably.
-            current_feature = current_feature.contiguous()
 
             lateral = self.lateral_convs[idx](current_feature)
             if prev_feature is not None:
@@ -497,11 +498,13 @@ class HeatmapHead(nn.Module):
                     mode='bilinear',
                     align_corners=False,
                 )
-                lateral = lateral + prev_feature
 
-            smoothed = self.output_convs[idx](lateral)
+                lateral = lateral + _ensure_contiguous(prev_feature)
+
+            smoothed = self.output_convs[idx](_ensure_contiguous(lateral))
             fpn_results[idx] = smoothed
-            prev_feature = smoothed.contiguous()
+            prev_feature = _ensure_contiguous(smoothed)
+
 
         fused_high_res = fpn_results[0]
         heatmap = self.decoder(fused_high_res)
