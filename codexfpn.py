@@ -55,8 +55,7 @@ class Config:
     # Loss settings
     WING_W = 5.0
     WING_EPSILON = 0.5
-    HEATMAP_SIGMA = 1.5  # Tighter gaussian for more precision
-    HEATMAP_POS_WEIGHT = 6.0  # Re-weight positive pixels to sharpen sparse targets
+    HEATMAP_SIGMA = 4.0  # Broader Gaussian keeps gradients dense during early training
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
 
     # Memory optimization flags
@@ -267,8 +266,8 @@ class FootballDataset(Dataset):
         # Create target heatmap
         target_heatmap = create_target_heatmap(heatmap_keypoints, self.heatmap_size)
         
-        # Store precise coordinates for direct regression
-        precise_coords = torch.tensor(keypoints[0], dtype=torch.float32)
+        # Store precise coordinates for direct regression (normalized to [0, 1])
+        precise_coords = torch.tensor(keypoints[0], dtype=torch.float32) / Config.IMAGE_SIZE
         
         return image, torch.from_numpy(target_heatmap).unsqueeze(0), precise_coords
 
@@ -295,24 +294,16 @@ class WingLoss(nn.Module):
 
 class CombinedLoss(nn.Module):
     """Combined loss for heatmap and coordinate regression."""
-    def __init__(self, heatmap_weight=0.7, coord_weight=0.3, pos_weight=None):
+    def __init__(self, heatmap_weight=0.7, coord_weight=0.3):
         super().__init__()
-        # Use BCE with logits to preserve gradients on sparse heatmaps.
-        # Re-weight positive pixels so the heatmap head is penalized more
-        # strongly when it activates away from the Gaussian target.
-        if pos_weight is None:
-            pos_weight = Config.HEATMAP_POS_WEIGHT
-        self.register_buffer(
-            "pos_weight",
-            torch.tensor(float(pos_weight), dtype=torch.float32)
-        )
-        self.heatmap_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        self.heatmap_loss = nn.MSELoss()
         # Keep SmoothL1 for coordinates
         self.coord_loss = nn.SmoothL1Loss()
         self.heatmap_weight = heatmap_weight
         self.coord_weight = coord_weight
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
+        pred_heatmaps = torch.sigmoid(pred_heatmaps)
         h_loss = self.heatmap_loss(pred_heatmaps, target_heatmaps)
 
         if pred_coords is not None and target_coords is not None:
@@ -532,7 +523,7 @@ class HeatmapHead(nn.Module):
 
         deepest_feature = self.coord_proj(features[-1])
         coords_raw = self.coord_regressor(deepest_feature)
-        coords = torch.sigmoid(coords_raw) * Config.IMAGE_SIZE
+        coords = torch.sigmoid(coords_raw)
 
         return heatmap, coords
 
@@ -735,20 +726,23 @@ def validate(model, dataloader, criterion, device, epoch):
             
             # Extract coordinates from heatmap for evaluation
             heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
-            
+
             # Scale heatmap coordinates back to image size
             heatmap_coords = heatmap_coords * (Config.IMAGE_SIZE / Config.HEATMAP_SIZE)
-            
+
+            pred_coords_pixels = pred_coords.detach().cpu() * Config.IMAGE_SIZE
+            target_coords_pixels = target_coords.detach().cpu() * Config.IMAGE_SIZE
+
             # Use combination of heatmap and direct predictions
-            final_coords = 0.6 * heatmap_coords.cpu() + 0.4 * pred_coords.cpu()
-            
+            final_coords = 0.6 * heatmap_coords.cpu() + 0.4 * pred_coords_pixels
+
             all_preds.append(final_coords)
-            all_targets.append(target_coords.cpu())
-            
+            all_targets.append(target_coords_pixels)
+
             # Calculate errors
             errors = torch.sqrt(
-                (final_coords[:, 0] - target_coords.cpu()[:, 0])**2 +
-                (final_coords[:, 1] - target_coords.cpu()[:, 1])**2
+                (final_coords[:, 0] - target_coords_pixels[:, 0])**2 +
+                (final_coords[:, 1] - target_coords_pixels[:, 1])**2
             )
             all_errors.extend(errors.tolist())
             
@@ -788,12 +782,15 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
     # Extract coordinates from heatmap
     heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
     heatmap_coords = heatmap_coords * (Config.IMAGE_SIZE / Config.HEATMAP_SIZE)
-    
+
+    pred_coords_pixels = pred_coords * Config.IMAGE_SIZE
+    target_coords_pixels = target_coords * Config.IMAGE_SIZE
+
     # Combined prediction
-    final_coords = 0.6 * heatmap_coords + 0.4 * pred_coords
+    final_coords = 0.6 * heatmap_coords + 0.4 * pred_coords_pixels
     # Move coords to CPU once for visualization to avoid device mismatches
     final_coords_cpu = final_coords.detach().cpu()
-    target_coords_cpu = target_coords.detach().cpu()
+    target_coords_cpu = target_coords_pixels.detach().cpu()
     
     # Prepare figure
     num_samples = min(num_samples, len(images))
