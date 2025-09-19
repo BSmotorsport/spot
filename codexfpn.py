@@ -472,10 +472,23 @@ class HeatmapHead(nn.Module):
                 f"Expected {self.num_scales} feature maps but received {len(features)}"
             )
 
+        def _ensure_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"Expected feature tensor but received {type(tensor)}"
+                )
+            return (
+                tensor
+                if tensor.is_contiguous(memory_format=torch.contiguous_format)
+                else tensor.contiguous()
+            )
+
         fpn_results = [None] * self.num_scales
         prev_feature = None
         for idx in reversed(range(self.num_scales)):
-            lateral = self.lateral_convs[idx](features[idx])
+            current_feature = _ensure_contiguous(features[idx])
+
+            lateral = self.lateral_convs[idx](current_feature)
             if prev_feature is not None:
                 prev_feature = F.interpolate(
                     prev_feature,
@@ -483,11 +496,11 @@ class HeatmapHead(nn.Module):
                     mode='bilinear',
                     align_corners=False,
                 )
-                lateral = lateral + prev_feature
+                lateral = lateral + _ensure_contiguous(prev_feature)
 
-            smoothed = self.output_convs[idx](lateral)
+            smoothed = self.output_convs[idx](_ensure_contiguous(lateral))
             fpn_results[idx] = smoothed
-            prev_feature = smoothed
+            prev_feature = _ensure_contiguous(smoothed)
 
         fused_high_res = fpn_results[0]
         heatmap = self.decoder(fused_high_res)
