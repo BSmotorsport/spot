@@ -347,19 +347,33 @@ class CombinedLoss(nn.Module):
             ratio = negative_count / (positive_count.item() + self._eps)
             pos_weight_value = float(max(1.0, min(ratio, 10.0)))
 
-        pos_weight = pred_heatmaps.new_full((1,), pos_weight_value)
+        # BCEWithLogitsLoss becomes numerically unstable in float16 when a
+        # non-unity ``pos_weight`` is used.  Once a few logits saturate the
+        # exponential in fp16 the gradients explode and the entire training
+        # run collapses to NaNs (which is exactly what we observed after a
+        # couple of epochs).  We therefore promote the logits/targets to
+        # float32 for the loss computation and then cast the result back so
+        # gradients still flow to the original tensor.
+        pos_weight = pred_heatmaps.new_full((1,), pos_weight_value, dtype=torch.float32)
+
+        pred_heatmaps_fp32 = pred_heatmaps.float()
+        target_heatmaps_fp32 = target_heatmaps.float()
 
         h_loss = F.binary_cross_entropy_with_logits(
-            pred_heatmaps,
-            target_heatmaps,
+            pred_heatmaps_fp32,
+            target_heatmaps_fp32,
             pos_weight=pos_weight,
         )
+        if pred_heatmaps.dtype != torch.float32:
+            h_loss = h_loss.to(pred_heatmaps.dtype)
 
         if pred_coords is not None and target_coords is not None:
             c_loss = self.coord_loss(pred_coords, target_coords)
-            return self.heatmap_weight * h_loss + self.coord_weight * c_loss, h_loss, c_loss
+            c_loss = c_loss.to(h_loss.dtype)
+            total_loss = self.heatmap_weight * h_loss + self.coord_weight * c_loss
+            return total_loss, h_loss, c_loss
 
-        return h_loss, h_loss, pred_heatmaps.new_tensor(0.0)
+        return h_loss, h_loss, pred_heatmaps.new_tensor(0.0, dtype=h_loss.dtype)
 
 
 def _make_group_norm(num_channels, max_groups=32):
