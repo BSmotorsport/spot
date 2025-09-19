@@ -301,19 +301,31 @@ class CombinedLoss(nn.Module):
         self.coord_loss = nn.SmoothL1Loss()
         self.heatmap_weight = heatmap_weight
         self.coord_weight = coord_weight
+        self._target_eps = 1e-4
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         # Leave heatmap logits unclamped so the MSE loss can propagate
         # healthy gradients even when the network is very confident about
         # foreground pixels. Visualization utilities downstream still
         # apply sigmoid before rendering.
+
+
+        # When comparing logits with an L2 objective, operate in the same
+        # domain for targets by transforming the ground-truth probabilities
+        # into logits. Clamping keeps the logit finite for blank background
+        # pixels while still preserving a strong gradient for confident
+        # foreground supervision.
+        target_heatmaps = torch.logit(
+            target_heatmaps.clamp(self._target_eps, 1 - self._target_eps)
+        )
+
         h_loss = self.heatmap_loss(pred_heatmaps, target_heatmaps)
 
         if pred_coords is not None and target_coords is not None:
             c_loss = self.coord_loss(pred_coords, target_coords)
             return self.heatmap_weight * h_loss + self.coord_weight * c_loss, h_loss, c_loss
 
-        return h_loss, h_loss, torch.tensor(0.0)
+        return h_loss, h_loss, pred_heatmaps.new_tensor(0.0)
 
 
 def _make_group_norm(num_channels, max_groups=32):
