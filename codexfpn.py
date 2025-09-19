@@ -330,15 +330,18 @@ class CombinedLoss(nn.Module):
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         target_heatmaps = target_heatmaps.to(dtype=pred_heatmaps.dtype)
 
-        total_elements = float(target_heatmaps.numel())
-        positive_mass = float(target_heatmaps.sum().item())
-        if positive_mass <= 0.0:
+        threshold = 0.01
+        positive_count = (target_heatmaps > threshold).float().sum()
+
+        if positive_count.item() <= 0.0:
             pos_weight_value = 1.0
         else:
-            negative_mass = max(total_elements - positive_mass, 0.0)
-            pos_weight_value = max(1.0, negative_mass / (positive_mass + self._eps))
+            total_elements = float(target_heatmaps.numel())
+            negative_count = max(total_elements - positive_count.item(), 0.0)
+            ratio = negative_count / (positive_count.item() + self._eps)
+            pos_weight_value = float(max(1.0, min(ratio, 10.0)))
 
-        pos_weight = pred_heatmaps.new_tensor([pos_weight_value])
+        pos_weight = pred_heatmaps.new_full((1,), pos_weight_value)
 
         h_loss = F.binary_cross_entropy_with_logits(
             pred_heatmaps,
