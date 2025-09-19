@@ -309,6 +309,7 @@ class CombinedLoss(nn.Module):
         # foreground pixels. Visualization utilities downstream still
         # apply sigmoid before rendering.
 
+
         # When comparing logits with an L2 objective, operate in the same
         # domain for targets by transforming the ground-truth probabilities
         # into logits. Clamping keeps the logit finite for blank background
