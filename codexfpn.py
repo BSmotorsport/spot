@@ -303,7 +303,10 @@ class CombinedLoss(nn.Module):
         self.coord_weight = coord_weight
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
-        pred_heatmaps = torch.sigmoid(pred_heatmaps)
+        # Leave heatmap logits unclamped so the MSE loss can propagate
+        # healthy gradients even when the network is very confident about
+        # foreground pixels. Visualization utilities downstream still
+        # apply sigmoid before rendering.
         h_loss = self.heatmap_loss(pred_heatmaps, target_heatmaps)
 
         if pred_coords is not None and target_coords is not None:
