@@ -56,6 +56,10 @@ class Config:
     HEATMAP_SIGMA = 1.5  # Tighter gaussian for more precision
     HEATMAP_POS_WEIGHT = 6.0  # Re-weight positive pixels to sharpen sparse targets
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
+
+    # Memory optimization flags
+    ENABLE_GRAD_CHECKPOINTING = True
+    USE_CHANNELS_LAST = True
     
     # Validation settings
     VALIDATE_EVERY_N_EPOCHS = 1
@@ -556,6 +560,10 @@ def create_model(pretrained=True):
         out_indices=(0, 1, 2, 3)  # Expose multiple stages for multi-scale fusion
     )
 
+    if Config.ENABLE_GRAD_CHECKPOINTING and hasattr(backbone, "set_grad_checkpointing"):
+        backbone.set_grad_checkpointing(True)
+        print("Enabled gradient checkpointing for backbone")
+
     # Get feature dimensions
     dummy_input = torch.randn(1, 3, Config.IMAGE_SIZE, Config.IMAGE_SIZE)
     with torch.no_grad():
@@ -628,7 +636,9 @@ def train_one_epoch(
     progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", colour="green")
 
     for batch_idx, (images, target_heatmaps, target_coords) in enumerate(progress_bar):
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
+        if Config.USE_CHANNELS_LAST:
+            images = images.to(memory_format=torch.channels_last)
         target_heatmaps = target_heatmaps.to(device)
         target_coords = target_coords.to(device)
 
@@ -705,7 +715,9 @@ def validate(model, dataloader, criterion, device, epoch):
     
     with torch.no_grad():
         for images, target_heatmaps, target_coords in progress_bar:
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
+            if Config.USE_CHANNELS_LAST:
+                images = images.to(memory_format=torch.channels_last)
             target_heatmaps = target_heatmaps.to(device)
             target_coords = target_coords.to(device)
             
@@ -955,7 +967,10 @@ def main():
     # 4. Create model
     # -------------------------------------------------------------------------
     print("\n🏗️ Building model...")
-    model = create_model(pretrained=True).to(Config.DEVICE)
+    to_kwargs = {'device': Config.DEVICE}
+    if Config.USE_CHANNELS_LAST:
+        to_kwargs['memory_format'] = torch.channels_last
+    model = create_model(pretrained=True).to(**to_kwargs)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -1128,6 +1143,9 @@ def main():
             # Unfreeze all parameters
             for param in model.parameters():
                 param.requires_grad = True
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Create new optimizer with all parameters
             optimizer = optim.AdamW(
