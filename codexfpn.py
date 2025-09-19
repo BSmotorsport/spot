@@ -14,6 +14,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import timm
 from tqdm import tqdm
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import cv2
 from sklearn.model_selection import train_test_split
