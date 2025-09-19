@@ -55,8 +55,10 @@ class Config:
     # Loss settings
     WING_W = 5.0
     WING_EPSILON = 0.5
-    HEATMAP_SIGMA = 4.0  # Broader Gaussian keeps gradients dense during early training
+    HEATMAP_SIGMA = 6.0  # Broader Gaussian keeps gradients dense during early training
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
+    HEATMAP_CONFIDENCE_THRESHOLD = 0.3  # Confidence needed before trusting heatmap coords
+    HEATMAP_CONFIDENCE_POWER = 2.0  # Sharpen confidence curve for fusion weights
 
     # Memory optimization flags
     ENABLE_GRAD_CHECKPOINTING = True
@@ -204,6 +206,20 @@ def get_coords_from_heatmap(heatmap, method='soft_argmax'):
         preds_x = (max_indices % width).float()
         return torch.stack([preds_x, preds_y], dim=1)
 
+
+def compute_heatmap_fusion_weight(heatmap_logits):
+    """Estimate how much trust to place in the heatmap branch."""
+    with torch.no_grad():
+        probs = torch.sigmoid(heatmap_logits)
+        max_confidence = probs.view(probs.size(0), -1).max(dim=1).values
+        confidence = (max_confidence - Config.HEATMAP_CONFIDENCE_THRESHOLD) / (
+            1.0 - Config.HEATMAP_CONFIDENCE_THRESHOLD + 1e-6
+        )
+        confidence = confidence.clamp(min=0.0, max=1.0)
+        if Config.HEATMAP_CONFIDENCE_POWER != 1.0:
+            confidence = confidence.pow(Config.HEATMAP_CONFIDENCE_POWER)
+    return confidence
+
 # ======================================================================================
 # 3. DATASET CLASS
 # ======================================================================================
@@ -296,34 +312,29 @@ class CombinedLoss(nn.Module):
     """Combined loss for heatmap and coordinate regression."""
     def __init__(self, heatmap_weight=0.7, coord_weight=0.3):
         super().__init__()
-        self.heatmap_loss = nn.MSELoss()
-        # Keep SmoothL1 for coordinates
         self.coord_loss = nn.SmoothL1Loss()
         self.heatmap_weight = heatmap_weight
         self.coord_weight = coord_weight
-        self._target_eps = 1e-4
+        self._eps = 1e-6
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
-        # Leave heatmap logits unclamped so the MSE loss can propagate
-        # healthy gradients even when the network is very confident about
-        # foreground pixels. Visualization utilities downstream still
-        # apply sigmoid before rendering.
+        target_heatmaps = target_heatmaps.to(dtype=pred_heatmaps.dtype)
 
+        total_elements = float(target_heatmaps.numel())
+        positive_mass = float(target_heatmaps.sum().item())
+        if positive_mass <= 0.0:
+            pos_weight_value = 1.0
+        else:
+            negative_mass = max(total_elements - positive_mass, 0.0)
+            pos_weight_value = max(1.0, negative_mass / (positive_mass + self._eps))
 
-        # When comparing logits with an L2 objective, operate in the same
-        # domain for targets by transforming the ground-truth probabilities
-        # into logits. Clamping keeps the logit finite for blank background
-        # pixels while still preserving a strong gradient for confident
-        # foreground supervision.
-        # Perform the logit in float32 so the clamp margin remains representable
-        # under autocast. This avoids the 1.0 rounding that occurs for float16
-        # tensors when using very small epsilons, which previously produced
-        # inf/NaN targets.
-        target_heatmaps = torch.logit(
-            target_heatmaps.to(dtype=torch.float32).clamp(self._target_eps, 1 - self._target_eps)
-        ).to(dtype=pred_heatmaps.dtype)
+        pos_weight = pred_heatmaps.new_tensor([pos_weight_value])
 
-        h_loss = self.heatmap_loss(pred_heatmaps, target_heatmaps)
+        h_loss = F.binary_cross_entropy_with_logits(
+            pred_heatmaps,
+            target_heatmaps,
+            pos_weight=pos_weight,
+        )
 
         if pred_coords is not None and target_coords is not None:
             c_loss = self.coord_loss(pred_coords, target_coords)
@@ -722,6 +733,7 @@ def validate(model, dataloader, criterion, device, epoch):
     all_preds = []
     all_targets = []
     all_errors = []
+    fusion_weight_log = []
     
     progress_bar = tqdm(dataloader, desc=f"Validation Epoch {epoch+1}", colour="yellow")
     
@@ -745,27 +757,34 @@ def validate(model, dataloader, criterion, device, epoch):
             
             # Extract coordinates from heatmap for evaluation
             heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
-
-            # Scale heatmap coordinates back to image size
             heatmap_coords = heatmap_coords * (Config.IMAGE_SIZE / Config.HEATMAP_SIZE)
 
-            pred_coords_pixels = pred_coords.detach().cpu() * Config.IMAGE_SIZE
-            target_coords_pixels = target_coords.detach().cpu() * Config.IMAGE_SIZE
+            pred_coords_pixels = pred_coords.detach() * Config.IMAGE_SIZE
+            target_coords_pixels = target_coords.detach() * Config.IMAGE_SIZE
 
-            # Use combination of heatmap and direct predictions
-            final_coords = 0.6 * heatmap_coords.cpu() + 0.4 * pred_coords_pixels
+            fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
+            fusion_weight_mean = fusion_weights.mean().item()
+            fusion_weight_log.append(fusion_weight_mean)
+            fusion_weights = fusion_weights.unsqueeze(1)
+            final_coords = fusion_weights * heatmap_coords + (1 - fusion_weights) * pred_coords_pixels
 
-            all_preds.append(final_coords)
-            all_targets.append(target_coords_pixels)
+            final_coords_cpu = final_coords.cpu()
+            target_coords_pixels_cpu = target_coords_pixels.cpu()
+
+            all_preds.append(final_coords_cpu)
+            all_targets.append(target_coords_pixels_cpu)
 
             # Calculate errors
             errors = torch.sqrt(
-                (final_coords[:, 0] - target_coords_pixels[:, 0])**2 +
-                (final_coords[:, 1] - target_coords_pixels[:, 1])**2
+                (final_coords_cpu[:, 0] - target_coords_pixels_cpu[:, 0])**2 +
+                (final_coords_cpu[:, 1] - target_coords_pixels_cpu[:, 1])**2
             )
             all_errors.extend(errors.tolist())
-            
-            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+            progress_bar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'w_hm': f"{fusion_weight_mean:.2f}"
+            })
     
     # Aggregate metrics
     avg_loss = total_loss / len(dataloader)
@@ -783,6 +802,9 @@ def validate(model, dataloader, criterion, device, epoch):
         print(f"\nError Percentiles - 50%: {percentiles[0]:.1f}px, "
               f"75%: {percentiles[1]:.1f}px, 95%: {percentiles[2]:.1f}px")
     
+    if fusion_weight_log:
+        print(f"Average heatmap fusion weight: {np.mean(fusion_weight_log):.2f}")
+
     return avg_loss, mae.item(), rmse.item(), all_errors
 
 def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samples=3):
@@ -805,9 +827,11 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
     pred_coords_pixels = pred_coords * Config.IMAGE_SIZE
     target_coords_pixels = target_coords * Config.IMAGE_SIZE
 
-    # Combined prediction
-    final_coords = 0.6 * heatmap_coords + 0.4 * pred_coords_pixels
-    # Move coords to CPU once for visualization to avoid device mismatches
+    fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
+    fusion_weights = fusion_weights.unsqueeze(1)
+    final_coords = fusion_weights * heatmap_coords + (1 - fusion_weights) * pred_coords_pixels
+
+    fusion_weights_cpu = fusion_weights.squeeze(1).cpu()
     final_coords_cpu = final_coords.detach().cpu()
     target_coords_cpu = target_coords_pixels.detach().cpu()
     
@@ -832,7 +856,8 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
         axes[i, 0].scatter(final_coords_cpu[i, 0], final_coords_cpu[i, 1],
                           c='red', s=100, marker='+', linewidths=3, label='Pred')
         axes[i, 0].set_title(
-            f'Image {i+1}: Error={torch.dist(final_coords_cpu[i], target_coords_cpu[i]):.1f}px'
+            f'Image {i+1}: Error={torch.dist(final_coords_cpu[i], target_coords_cpu[i]):.1f}px, '
+            f'w_hm={fusion_weights_cpu[i].item():.2f}'
         )
         axes[i, 0].legend()
         axes[i, 0].axis('off')
