@@ -54,6 +54,7 @@ class Config:
     WING_W = 5.0
     WING_EPSILON = 0.5
     HEATMAP_SIGMA = 1.5  # Tighter gaussian for more precision
+    HEATMAP_POS_WEIGHT = 6.0  # Re-weight positive pixels to sharpen sparse targets
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
     
     # Validation settings
@@ -288,10 +289,18 @@ class WingLoss(nn.Module):
 
 class CombinedLoss(nn.Module):
     """Combined loss for heatmap and coordinate regression."""
-    def __init__(self, heatmap_weight=0.7, coord_weight=0.3):
+    def __init__(self, heatmap_weight=0.7, coord_weight=0.3, pos_weight=None):
         super().__init__()
-        # Use BCE with logits to preserve gradients on sparse heatmaps
-        self.heatmap_loss = nn.BCEWithLogitsLoss()
+        # Use BCE with logits to preserve gradients on sparse heatmaps.
+        # Re-weight positive pixels so the heatmap head is penalized more
+        # strongly when it activates away from the Gaussian target.
+        if pos_weight is None:
+            pos_weight = Config.HEATMAP_POS_WEIGHT
+        self.register_buffer(
+            "pos_weight",
+            torch.tensor(float(pos_weight), dtype=torch.float32)
+        )
+        self.heatmap_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
         # Keep SmoothL1 for coordinates
         self.coord_loss = nn.SmoothL1Loss()
         self.heatmap_weight = heatmap_weight
@@ -802,7 +811,9 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
         axes[i, 1].axis('off')
         
         # Plot predicted heatmap
-        pred_hm = pred_heatmaps[i, 0].cpu().numpy()
+        # Convert logits to calibrated probabilities before plotting to expose
+        # the peak the network has learned rather than raw activation edges.
+        pred_hm = torch.sigmoid(pred_heatmaps[i, 0]).cpu().numpy()
         axes[i, 2].imshow(pred_hm, cmap='hot', interpolation='nearest')
         axes[i, 2].set_title(f'Pred Heatmap (max={pred_hm.max():.3f})')
         axes[i, 2].axis('off')
@@ -967,7 +978,7 @@ def main():
         eps=1e-8
     )
 
-    criterion = CombinedLoss(heatmap_weight=0.7, coord_weight=0.3)
+    criterion = CombinedLoss(heatmap_weight=0.7, coord_weight=0.3).to(Config.DEVICE)
 
     scheduler = None
     
