@@ -55,7 +55,9 @@ class Config:
     # Loss settings
     WING_W = 5.0
     WING_EPSILON = 0.5
-    HEATMAP_SIGMA = 8.0  # Slightly broader Gaussian keeps gradients dense during early training
+    HEATMAP_SIGMA_START = 10.0  # Start with a broader Gaussian for denser early gradients
+    HEATMAP_SIGMA_END = 4.0     # Anneal towards a sharper target later in training
+    HEATMAP_SIGMA_DECAY_EPOCHS = 50
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
     HEATMAP_CONFIDENCE_THRESHOLD = 0.3  # Confidence needed before trusting heatmap coords
     HEATMAP_CONFIDENCE_POWER = 2.0  # Sharpen confidence curve for fusion weights
@@ -139,7 +141,7 @@ def mixup_data(images, heatmaps, coords, alpha=0.2):
 def create_target_heatmap(keypoints, size, sigma=None):
     """Create Gaussian heatmap for keypoints with proper normalization."""
     if sigma is None:
-        sigma = Config.HEATMAP_SIGMA
+        sigma = Config.HEATMAP_SIGMA_START
         
     heatmap = np.zeros((size, size), dtype=np.float32)
     
@@ -242,11 +244,19 @@ def compute_heatmap_fusion_weight(heatmap_logits):
 # ======================================================================================
 
 class FootballDataset(Dataset):
-    def __init__(self, image_paths, transform=None, heatmap_size=192, augment=True):
+    def __init__(
+        self,
+        image_paths,
+        transform=None,
+        heatmap_size=192,
+        augment=True,
+        heatmap_sigma=None,
+    ):
         self.image_paths = image_paths
         self.transform = transform
         self.heatmap_size = heatmap_size
         self.augment = augment
+        self.heatmap_sigma = heatmap_sigma if heatmap_sigma is not None else Config.HEATMAP_SIGMA_START
         
         # Pre-filter valid images
         self.valid_paths = []
@@ -304,13 +314,28 @@ class FootballDataset(Dataset):
         target_heatmap = create_target_heatmap(
             heatmap_keypoints,
             self.heatmap_size,
-            sigma=Config.HEATMAP_SIGMA,
+            sigma=self.heatmap_sigma,
         )
 
         # Store precise coordinates for direct regression (normalized to [0, 1])
         precise_coords = torch.tensor(keypoints[0], dtype=torch.float32) / (Config.IMAGE_SIZE - 1)
         
         return image, torch.from_numpy(target_heatmap).unsqueeze(0), precise_coords
+
+    def set_heatmap_sigma(self, sigma):
+        self.heatmap_sigma = float(sigma)
+
+
+def compute_sigma_for_epoch(epoch):
+    """Linearly anneal the target sigma during training for denser early gradients."""
+    if Config.HEATMAP_SIGMA_DECAY_EPOCHS <= 0:
+        return Config.HEATMAP_SIGMA_END
+
+    progress = min(max(epoch, 0) / Config.HEATMAP_SIGMA_DECAY_EPOCHS, 1.0)
+    return (
+        Config.HEATMAP_SIGMA_START
+        + (Config.HEATMAP_SIGMA_END - Config.HEATMAP_SIGMA_START) * progress
+    )
 
 # ======================================================================================
 # 4. LOSS FUNCTIONS
@@ -707,7 +732,7 @@ def train_one_epoch(
         target_heatmaps = target_heatmaps.to(device)
         target_coords = target_coords.to(device)
 
-        if use_mixup and np.random.rand() < 0.5:
+        if use_mixup and images.size(0) > 1 and np.random.rand() < 0.5:
             (
                 images,
                 target_a,
@@ -1057,14 +1082,16 @@ def main():
     # 3. Create datasets and dataloaders
     # -------------------------------------------------------------------------
     train_dataset = FootballDataset(
-        train_files, 
-        transform=train_transform, 
-        heatmap_size=Config.HEATMAP_SIZE
+        train_files,
+        transform=train_transform,
+        heatmap_size=Config.HEATMAP_SIZE,
+        heatmap_sigma=Config.HEATMAP_SIGMA_START,
     )
     val_dataset = FootballDataset(
-        val_files, 
-        transform=val_transform, 
-        heatmap_size=Config.HEATMAP_SIZE
+        val_files,
+        transform=val_transform,
+        heatmap_size=Config.HEATMAP_SIZE,
+        heatmap_sigma=Config.HEATMAP_SIGMA_END,
     )
     
     train_loader = DataLoader(
@@ -1255,6 +1282,11 @@ def main():
     print("\n🚀 Starting training...")
     
     for epoch in range(start_epoch, Config.EPOCHS):
+        current_sigma = compute_sigma_for_epoch(epoch)
+        train_dataset.set_heatmap_sigma(current_sigma)
+        if (epoch % 5 == 0) or (epoch < 5):
+            print(f"Using heatmap sigma {current_sigma:.2f} for epoch {epoch+1}")
+
         # Check if we should unfreeze the backbone
         if epoch == Config.UNFREEZE_EPOCH:
             print("\n" + "="*80)
