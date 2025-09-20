@@ -287,7 +287,21 @@ class FootballDataset(Dataset):
             transformed = self.transform(image=image, keypoints=keypoints)
             image = transformed['image']
             keypoints = transformed.get('keypoints', [])
-            
+
+            # Filter/clamp keypoints to valid image region after augmentation
+            valid_keypoints = []
+            if keypoints:
+                max_coord = float(np.nextafter(Config.IMAGE_SIZE, -np.inf))
+                for kp in keypoints:
+                    if len(kp) < 2:
+                        continue
+                    x, y = float(kp[0]), float(kp[1])
+                    if 0.0 <= x < Config.IMAGE_SIZE and 0.0 <= y < Config.IMAGE_SIZE:
+                        clamped_x = min(max(x, 0.0), max_coord)
+                        clamped_y = min(max(y, 0.0), max_coord)
+                        valid_keypoints.append((clamped_x, clamped_y))
+            keypoints = valid_keypoints
+
             # Skip if augmentation removed the keypoint
             if not keypoints:
                 return self.__getitem__((idx + 1) % len(self))
@@ -1078,7 +1092,7 @@ def main():
         A.GaussNoise(p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
-    ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+    ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=True))
     
     val_transform = A.Compose([
         A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
