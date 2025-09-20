@@ -60,7 +60,7 @@ class Config:
     HEATMAP_SIGMA_DECAY_EPOCHS = 50
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
     HEATMAP_CONFIDENCE_THRESHOLD = 0.3  # Confidence needed before trusting heatmap coords
-    HEATMAP_CONFIDENCE_POWER = 2.0  # Sharpen confidence curve for fusion weights
+    HEATMAP_CONFIDENCE_SCALE = 1.0  # Linear scaling factor for heatmap fusion weights
 
     # Memory optimization flags
     ENABLE_GRAD_CHECKPOINTING = True
@@ -217,25 +217,18 @@ def compute_heatmap_fusion_weight(heatmap_logits):
         logits = heatmap_logits.float()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
 
-        batch_size = logits.size(0)
-        flattened = logits.view(batch_size, -1)
-        probs = torch.softmax(flattened, dim=1)
+        probs = torch.sigmoid(logits)
         probs = torch.nan_to_num(probs, nan=0.0)
 
-        topk = min(10, probs.size(1))
-        topk_probs, _ = torch.topk(probs, k=topk, dim=1)
-        top1 = topk_probs[:, 0]
-        mean_topk = topk_probs.mean(dim=1)
+        flattened = probs.flatten(start_dim=1)
+        peak = flattened.amax(dim=1)
+        mean = flattened.mean(dim=1)
 
-        # Convert the sharpness statistic into the [0, 1] range. When the peak is
-        # extremely sharp, mean_topk << top1 and the confidence approaches 1. For
-        # broad/ambiguous maps, top1 ~= mean_topk and the confidence approaches 0.
-        confidence = 1.0 - (mean_topk / (top1 + 1e-8))
-        confidence = torch.nan_to_num(confidence, nan=0.0)
-        confidence = confidence.clamp(min=0.0, max=1.0)
+        confidence = (peak - mean) / (peak + 1e-6)
+        confidence = confidence.clamp_(0.0, 1.0)
 
-        if Config.HEATMAP_CONFIDENCE_POWER != 1.0:
-            confidence = confidence.pow(Config.HEATMAP_CONFIDENCE_POWER)
+        if Config.HEATMAP_CONFIDENCE_SCALE != 1.0:
+            confidence = (confidence * Config.HEATMAP_CONFIDENCE_SCALE).clamp_(0.0, 1.0)
 
     return confidence
 
