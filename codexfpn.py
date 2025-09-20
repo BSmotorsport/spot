@@ -372,11 +372,26 @@ class CombinedLoss(nn.Module):
             pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
             target_heatmaps_fp32 = target_heatmaps.to(dtype=torch.float32)
 
-            # Use a friendlier regression-style loss on probabilities so sparse targets
-            # still generate gradients early in training.
-            h_loss = F.mse_loss(
-                torch.sigmoid(pred_heatmaps_fp32),
-                target_heatmaps_fp32,
+            # Switch to a logits-based loss that dramatically up-weights pixels near the
+            # bright center of the Gaussian target.  This keeps background regions from
+            # dominating the objective while still benefiting from numerically stable
+            # BCE-with-logits gradients.
+            prob = torch.sigmoid(pred_heatmaps_fp32)
+
+            target_clamped = target_heatmaps_fp32.clamp(0.0, 1.0)
+            bright_weight = 1.0 + 99.0 * target_clamped
+            focal_modulation = torch.where(
+                target_clamped > 0.01,
+                (1.0 - prob).pow(2.0),
+                prob.pow(2.0),
+            )
+            weight = bright_weight * (1.0 + focal_modulation)
+
+            h_loss = F.binary_cross_entropy_with_logits(
+                pred_heatmaps_fp32,
+                target_clamped,
+                weight=weight,
+                reduction='mean',
             )
 
             if pred_coords is not None and target_coords is not None:
