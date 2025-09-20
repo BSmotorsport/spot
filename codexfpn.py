@@ -1100,7 +1100,7 @@ def main():
         shuffle=True,
         num_workers=Config.NUM_WORKERS,
         pin_memory=True,
-        persistent_workers=Config.NUM_WORKERS > 0
+        persistent_workers=False  # allow heatmap sigma updates to reach workers each epoch
     )
 
     val_loader = DataLoader(
@@ -1109,7 +1109,7 @@ def main():
         shuffle=False,
         num_workers=Config.NUM_WORKERS,
         pin_memory=True,
-        persistent_workers=Config.NUM_WORKERS > 0
+        persistent_workers=False
     )
 
     print(f"\n✅ Dataloaders created successfully")
