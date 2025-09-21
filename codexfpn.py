@@ -28,7 +28,7 @@ from torch.amp import GradScaler, autocast
 # ======================================================================================
 class Config:
     DATASET_PATH = r"E:\BOTB\dataset\aug"
-    OUTPUT_DIR = r"./training_output_convnext"
+    OUTPUT_DIR = r"./training_output_codexfpn2"
     MODEL_VERSION = "ConvNext_heatmap_combined"
     
     # Image dimensions
@@ -1377,7 +1377,7 @@ def main():
             print(f"  Val RMSE: {val_rmse:.2f} pixels")
             
             # Save sample predictions for visual inspection
-            if (epoch + 1) % 5 == 0 or epoch < 5:  # Every 5 epochs or first 5 epochs
+            if (epoch + 1) % 5 == 0 or epoch < 25:  # Every 5 epochs or first 5 epochs
                 sample_path = save_sample_predictions(
                     model, val_loader, Config.DEVICE, epoch, Config.OUTPUT_DIR
                 )
@@ -1434,3 +1434,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"\n\n❌ Error during training: {str(e)}")
         raise
+
