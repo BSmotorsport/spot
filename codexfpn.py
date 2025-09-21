@@ -225,6 +225,11 @@ def compute_heatmap_fusion_weight(heatmap_logits):
         mean = flattened.mean(dim=1)
 
         confidence = (peak - mean) / (peak + 1e-6)
+        confidence = torch.where(
+            confidence >= Config.HEATMAP_CONFIDENCE_THRESHOLD,
+            confidence,
+            torch.zeros_like(confidence),
+        )
         confidence = confidence.clamp_(0.0, 1.0)
 
         if Config.HEATMAP_CONFIDENCE_SCALE != 1.0:
