@@ -25,7 +25,7 @@ def test_combined_loss_pushes_max_probability_above_half():
     # Run a miniature training loop that mimics a single epoch worth of updates.
     for _ in range(120):
         optimizer.zero_grad()
-        total_loss, h_loss, c_loss = criterion(logits, target)
+        total_loss, h_loss, c_loss, pixel_loss = criterion(logits, target)
         total_loss.backward()
         optimizer.step()
 
@@ -33,3 +33,4 @@ def test_combined_loss_pushes_max_probability_above_half():
         probs = torch.sigmoid(logits)
 
     assert probs.max().item() > 0.5, "weighted BCE should push the peak probability well above 0.5"
+    assert pixel_loss.item() == pytest.approx(0.0), "pixel loss should be zero when coordinates are absent"

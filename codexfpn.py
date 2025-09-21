@@ -59,8 +59,19 @@ class Config:
     HEATMAP_SIGMA_END = 4.0     # Anneal towards a sharper target later in training
     HEATMAP_SIGMA_DECAY_EPOCHS = 50
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
-    HEATMAP_CONFIDENCE_THRESHOLD = 0.3  # Confidence needed before trusting heatmap coords
+    ENABLE_MIXUP = False  # Disable by default for single-keypoint stability
+
+    # Fusion gate tuning
+    HEATMAP_CONFIDENCE_THRESHOLD = 0.65  # Confidence needed before heavily trusting heatmap coords
     HEATMAP_CONFIDENCE_SCALE = 1.0  # Linear scaling factor for heatmap fusion weights
+    HEATMAP_MIN_FUSION_WEIGHT = 0.15  # Always leave some weight on the regressor branch
+    HEATMAP_CONFIDENCE_WARMUP_EPOCHS = 5  # Gradually enable the gate after unfreezing
+    HEATMAP_CONFIDENCE_GAMMA = 1.5  # Sharpen confidence response once above threshold
+
+    # Loss weighting
+    HEATMAP_LOSS_WEIGHT = 0.55
+    COORD_LOSS_WEIGHT = 0.25
+    PIXEL_COORD_LOSS_WEIGHT = 0.20
 
     # Memory optimization flags
     ENABLE_GRAD_CHECKPOINTING = True
@@ -211,8 +222,9 @@ def get_coords_from_heatmap(heatmap, method='soft_argmax'):
         return torch.stack([preds_x, preds_y], dim=1)
 
 
-def compute_heatmap_fusion_weight(heatmap_logits):
+def compute_heatmap_fusion_weight(heatmap_logits, epoch=None):
     """Estimate how much trust to place in the heatmap branch."""
+
     with torch.no_grad():
         logits = heatmap_logits.float()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
@@ -225,17 +237,34 @@ def compute_heatmap_fusion_weight(heatmap_logits):
         mean = flattened.mean(dim=1)
 
         confidence = (peak - mean) / (peak + 1e-6)
-        confidence = torch.where(
-            confidence >= Config.HEATMAP_CONFIDENCE_THRESHOLD,
-            confidence,
-            torch.zeros_like(confidence),
-        )
-        confidence = confidence.clamp_(0.0, 1.0)
+        confidence = torch.nan_to_num(confidence, nan=0.0, posinf=0.0, neginf=0.0)
+
+        threshold = float(Config.HEATMAP_CONFIDENCE_THRESHOLD)
+        denom = max(1e-6, 1.0 - threshold)
+        if threshold >= 1.0:
+            gated = torch.zeros_like(confidence)
+        else:
+            gated = torch.clamp((confidence - threshold) / denom, min=0.0, max=1.0)
+
+        if Config.HEATMAP_CONFIDENCE_GAMMA != 1.0:
+            gated = gated.pow(Config.HEATMAP_CONFIDENCE_GAMMA)
+
+        min_weight = float(np.clip(Config.HEATMAP_MIN_FUSION_WEIGHT, 0.0, 1.0))
+        weight = min_weight + (1.0 - min_weight) * gated
+
+        if epoch is not None and Config.HEATMAP_CONFIDENCE_WARMUP_EPOCHS > 0:
+            warmup_progress = min(
+                max((epoch + 1) / Config.HEATMAP_CONFIDENCE_WARMUP_EPOCHS, 0.0),
+                1.0,
+            )
+            weight = min_weight + (weight - min_weight) * warmup_progress
 
         if Config.HEATMAP_CONFIDENCE_SCALE != 1.0:
-            confidence = (confidence * Config.HEATMAP_CONFIDENCE_SCALE).clamp_(0.0, 1.0)
+            weight = weight * Config.HEATMAP_CONFIDENCE_SCALE
 
-    return confidence
+        weight = torch.clamp(weight, min=min_weight, max=1.0)
+
+    return weight
 
 # ======================================================================================
 # 3. DATASET CLASS
@@ -372,11 +401,26 @@ class WingLoss(nn.Module):
 
 class CombinedLoss(nn.Module):
     """Combined loss for heatmap and coordinate regression."""
-    def __init__(self, heatmap_weight=0.7, coord_weight=0.3):
+
+    def __init__(
+        self,
+        heatmap_weight: float | None = None,
+        coord_weight: float | None = None,
+        pixel_coord_weight: float | None = None,
+    ) -> None:
         super().__init__()
         self.coord_loss = nn.SmoothL1Loss()
-        self.heatmap_weight = heatmap_weight
-        self.coord_weight = coord_weight
+        self.pixel_coord_weight = (
+            Config.PIXEL_COORD_LOSS_WEIGHT
+            if pixel_coord_weight is None
+            else float(pixel_coord_weight)
+        )
+        self.heatmap_weight = (
+            Config.HEATMAP_LOSS_WEIGHT if heatmap_weight is None else float(heatmap_weight)
+        )
+        self.coord_weight = (
+            Config.COORD_LOSS_WEIGHT if coord_weight is None else float(coord_weight)
+        )
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         device_type = pred_heatmaps.device.type
@@ -410,16 +454,26 @@ class CombinedLoss(nn.Module):
                 reduction='mean',
             )
 
+            total_loss = self.heatmap_weight * h_loss
+            c_loss = pred_heatmaps_fp32.new_tensor(0.0)
+            pixel_loss = pred_heatmaps_fp32.new_tensor(0.0)
+
             if pred_coords is not None and target_coords is not None:
                 pred_coords_fp32 = pred_coords.to(dtype=torch.float32)
                 target_coords_fp32 = target_coords.to(dtype=torch.float32)
                 c_loss = self.coord_loss(pred_coords_fp32, target_coords_fp32)
-                total_loss = self.heatmap_weight * h_loss + self.coord_weight * c_loss
-            else:
-                c_loss = pred_heatmaps_fp32.new_tensor(0.0)
-                total_loss = self.heatmap_weight * h_loss
 
-        return total_loss, h_loss, c_loss
+                if self.coord_weight > 0.0:
+                    total_loss = total_loss + self.coord_weight * c_loss
+
+                if self.pixel_coord_weight > 0.0:
+                    image_extent = float(Config.IMAGE_SIZE - 1)
+                    pred_pixels = pred_coords_fp32 * image_extent
+                    target_pixels = target_coords_fp32 * image_extent
+                    pixel_loss = torch.mean(torch.abs(pred_pixels - target_pixels))
+                    total_loss = total_loss + self.pixel_coord_weight * pixel_loss
+
+        return total_loss, h_loss, c_loss, pixel_loss
 
 
 def _make_group_norm(num_channels, max_groups=32):
@@ -742,7 +796,7 @@ def train_one_epoch(
     epoch,
     scheduler=None,
     grad_accum_steps=1,
-    use_mixup=True,
+    use_mixup=None,
 ):
     """Train for one epoch with mixed precision, mixup, and gradient accumulation."""
 
@@ -750,11 +804,15 @@ def train_one_epoch(
     total_loss = 0.0
     total_heatmap_loss = 0.0
     total_coord_loss = 0.0
+    total_pixel_loss = 0.0
 
     num_batches = len(dataloader)
     optimizer.zero_grad(set_to_none=True)
 
     progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", colour="green")
+
+    if use_mixup is None:
+        use_mixup = Config.ENABLE_MIXUP and Config.MIXUP_ALPHA > 0.0
 
     for batch_idx, (images, target_heatmaps, target_coords) in enumerate(progress_bar):
         images = images.to(device, non_blocking=True)
@@ -783,13 +841,20 @@ def train_one_epoch(
             pred_heatmaps, pred_coords = model(images)
 
             if target_b is not None and coords_b is not None:
-                loss_a, h_loss_a, c_loss_a = criterion(pred_heatmaps, target_a, pred_coords, coords_a)
-                loss_b, h_loss_b, c_loss_b = criterion(pred_heatmaps, target_b, pred_coords, coords_b)
+                loss_a, h_loss_a, c_loss_a, p_loss_a = criterion(
+                    pred_heatmaps, target_a, pred_coords, coords_a
+                )
+                loss_b, h_loss_b, c_loss_b, p_loss_b = criterion(
+                    pred_heatmaps, target_b, pred_coords, coords_b
+                )
                 loss = lam * loss_a + (1 - lam) * loss_b
                 h_loss = lam * h_loss_a + (1 - lam) * h_loss_b
                 c_loss = lam * c_loss_a + (1 - lam) * c_loss_b
+                p_loss = lam * p_loss_a + (1 - lam) * p_loss_b
             else:
-                loss, h_loss, c_loss = criterion(pred_heatmaps, target_a, pred_coords, coords_a)
+                loss, h_loss, c_loss, p_loss = criterion(
+                    pred_heatmaps, target_a, pred_coords, coords_a
+                )
 
         if not torch.isfinite(loss):
             print("\n⚠️ Non-finite loss encountered, skipping batch to protect training stability.")
@@ -800,6 +865,7 @@ def train_one_epoch(
         total_loss += loss.item()
         total_heatmap_loss += h_loss.item()
         total_coord_loss += c_loss.item()
+        total_pixel_loss += p_loss.item()
 
         scaled_loss = loss / grad_accum_steps
         scaler.scale(scaled_loss).backward()
@@ -824,14 +890,16 @@ def train_one_epoch(
                 'loss': f"{loss.item():.4f}",
                 'h_loss': f"{h_loss.item():.4f}",
                 'c_loss': f"{c_loss.item():.4f}",
+                'p_loss': f"{p_loss.item():.4f}",
             }
         )
 
     avg_loss = total_loss / num_batches
     avg_h_loss = total_heatmap_loss / num_batches
     avg_c_loss = total_coord_loss / num_batches
+    avg_p_loss = total_pixel_loss / num_batches
 
-    return avg_loss, avg_h_loss, avg_c_loss
+    return avg_loss, avg_h_loss, avg_c_loss, avg_p_loss
 
 def validate(model, dataloader, criterion, device, epoch):
     """Validate the model and compute metrics."""
@@ -841,7 +909,8 @@ def validate(model, dataloader, criterion, device, epoch):
     all_targets = []
     all_errors = []
     fusion_weight_log = []
-    
+    total_pixel_loss = 0.0
+
     progress_bar = tqdm(dataloader, desc=f"Validation Epoch {epoch+1}", colour="yellow")
 
     total_heatmap_abs_error = 0.0
@@ -859,12 +928,15 @@ def validate(model, dataloader, criterion, device, epoch):
             # Forward pass
             with autocast(device_type='cuda' if device == 'cuda' else 'cpu', dtype=torch.float16):
                 pred_heatmaps, pred_coords = model(images)
-                loss, _, _ = criterion(
-                    pred_heatmaps, target_heatmaps,
-                    pred_coords, target_coords
+                loss, _, _, pixel_loss = criterion(
+                    pred_heatmaps,
+                    target_heatmaps,
+                    pred_coords,
+                    target_coords,
                 )
-            
+
             total_loss += loss.item()
+            total_pixel_loss += pixel_loss.item()
             
             # Extract coordinates from heatmap for evaluation
             heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
@@ -882,7 +954,7 @@ def validate(model, dataloader, criterion, device, epoch):
             total_regressor_abs_error += torch.abs(pred_coords_pixels - target_coords_pixels).sum().item()
             total_coord_elems += heatmap_coords.numel()
 
-            fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
+            fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps, epoch=epoch)
             fusion_weight_mean = fusion_weights.mean().item()
             fusion_weight_log.append(fusion_weight_mean)
             fusion_weights = fusion_weights.unsqueeze(1)
@@ -908,6 +980,7 @@ def validate(model, dataloader, criterion, device, epoch):
     
     # Aggregate metrics
     avg_loss = total_loss / len(dataloader)
+    avg_pixel_loss = total_pixel_loss / len(dataloader)
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     
@@ -933,7 +1006,18 @@ def validate(model, dataloader, criterion, device, epoch):
     if fusion_weight_log:
         print(f"Average heatmap fusion weight: {np.mean(fusion_weight_log):.2f}")
 
-    return avg_loss, mae.item(), rmse.item(), all_errors
+    return (
+        avg_loss,
+        mae.item(),
+        rmse.item(),
+        all_errors,
+        {
+            'pixel_loss': avg_pixel_loss,
+            'heatmap_mae': mae_heatmap,
+            'regressor_mae': mae_regressor,
+            'fusion_weight': np.mean(fusion_weight_log) if fusion_weight_log else 0.0,
+        },
+    )
 
 def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samples=3):
     """Save sample predictions with heatmap visualizations."""
@@ -960,7 +1044,7 @@ def save_sample_predictions(model, val_loader, device, epoch, save_dir, num_samp
     pred_coords_pixels = pred_coords * (Config.IMAGE_SIZE - 1)
     target_coords_pixels = target_coords * (Config.IMAGE_SIZE - 1)
 
-    fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps)
+    fusion_weights = compute_heatmap_fusion_weight(pred_heatmaps, epoch=epoch)
     fusion_weights = fusion_weights.unsqueeze(1)
     final_coords = fusion_weights * heatmap_coords + (1 - fusion_weights) * pred_coords_pixels
 
@@ -1179,7 +1263,7 @@ def main():
         eps=1e-8
     )
 
-    criterion = CombinedLoss(heatmap_weight=0.7, coord_weight=0.3).to(Config.DEVICE)
+    criterion = CombinedLoss().to(Config.DEVICE)
 
     scheduler = None
     
@@ -1349,7 +1433,7 @@ def main():
         print(f"Learning rates: {lr_report}")
 
         # Training phase
-        train_loss, train_h_loss, train_c_loss = train_one_epoch(
+        train_loss, train_h_loss, train_c_loss, train_p_loss = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -1360,10 +1444,10 @@ def main():
             scheduler=scheduler,
             grad_accum_steps=Config.GRAD_ACCUM_STEPS,
         )
-        
+
         # Validation phase
         if (epoch + 1) % Config.VALIDATE_EVERY_N_EPOCHS == 0:
-            val_loss, val_mae, val_rmse, val_errors = validate(
+            val_loss, val_mae, val_rmse, val_errors, val_stats = validate(
                 model, val_loader, criterion, Config.DEVICE, epoch
             )
 
@@ -1376,8 +1460,16 @@ def main():
             
             # Print epoch summary
             print(f"\n📊 Epoch {epoch+1} Summary:")
-            print(f"  Train Loss: {train_loss:.4f} (H: {train_h_loss:.4f}, C: {train_c_loss:.4f})")
-            print(f"  Val Loss: {val_loss:.4f}")
+            print(
+                "  Train Loss: "
+                f"{train_loss:.4f} (H: {train_h_loss:.4f}, C: {train_c_loss:.4f}, Px: {train_p_loss:.4f})"
+            )
+            print(
+                "  Val Loss: "
+                f"{val_loss:.4f} (Px: {val_stats['pixel_loss']:.4f}, "
+                f"HM-MAE: {val_stats['heatmap_mae']:.2f}px, Reg-MAE: {val_stats['regressor_mae']:.2f}px, "
+                f"w_hm: {val_stats['fusion_weight']:.2f})"
+            )
             print(f"  Val MAE: {val_mae:.2f} pixels")
             print(f"  Val RMSE: {val_rmse:.2f} pixels")
             
