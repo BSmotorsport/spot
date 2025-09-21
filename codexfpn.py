@@ -392,7 +392,11 @@ class CombinedLoss(nn.Module):
                 (1.0 - prob).pow(2.0),
                 prob.pow(2.0),
             )
-            weight = bright_weight * (1.0 + focal_modulation)
+            # Detach the dynamically generated weight tensor.  BCE-with-logits does not
+            # support gradient propagation through the ``weight`` argument, so we ensure
+            # it remains a statically valued tensor while still reflecting the latest
+            # prediction-dependent modulation.
+            weight = (bright_weight * (1.0 + focal_modulation)).detach()
 
             h_loss = F.binary_cross_entropy_with_logits(
                 pred_heatmaps_fp32,
