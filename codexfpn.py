@@ -810,6 +810,7 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     accumulation_counter = 0
+    has_scaled_grads = False
     processed_batches = 0
 
     progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", colour="green")
@@ -863,6 +864,7 @@ def train_one_epoch(
             print("\n⚠️ Non-finite loss encountered, skipping batch to protect training stability.")
             optimizer.zero_grad(set_to_none=True)
             accumulation_counter = 0
+            has_scaled_grads = False
             continue
 
         total_loss += loss.item()
@@ -874,11 +876,12 @@ def train_one_epoch(
 
         scaled_loss = loss / grad_accum_steps
         scaler.scale(scaled_loss).backward()
+        has_scaled_grads = True
 
         accumulation_counter += 1
 
         should_step = accumulation_counter >= grad_accum_steps or (batch_idx + 1) == num_batches
-        if should_step and accumulation_counter > 0:
+        if should_step and accumulation_counter > 0 and has_scaled_grads:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -892,6 +895,7 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             accumulation_counter = 0
+            has_scaled_grads = False
 
         progress_bar.set_postfix(
             {
