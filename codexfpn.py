@@ -101,6 +101,18 @@ set_seeds(Config.RANDOM_SEED)
 # 2. HELPER FUNCTIONS
 # ======================================================================================
 
+def _autocast_kwargs_for(device: torch.device | str) -> dict[str, object]:
+    """Return safe autocast kwargs for the requested device."""
+
+    device_str = device.type if isinstance(device, torch.device) else str(device)
+    device_type = 'cuda' if device_str.startswith('cuda') else 'cpu'
+
+    if device_type == 'cuda' and torch.cuda.is_available():
+        return {'device_type': 'cuda', 'dtype': torch.float16}
+
+    return {'device_type': device_type, 'enabled': False}
+
+
 def parse_filename(filename):
     """Parse filename to extract ball coordinates with validation."""
     try:
@@ -841,7 +853,7 @@ def train_one_epoch(
             coords_b = None
             lam = 1.0
 
-        with autocast(device_type='cuda' if device == 'cuda' else 'cpu', dtype=torch.float16):
+        with autocast(**_autocast_kwargs_for(device)):
             pred_heatmaps, pred_coords = model(images)
 
             if target_b is not None and coords_b is not None:
@@ -940,7 +952,7 @@ def validate(model, dataloader, criterion, device, epoch):
             target_coords = target_coords.to(device)
             
             # Forward pass
-            with autocast(device_type='cuda' if device == 'cuda' else 'cpu', dtype=torch.float16):
+            with autocast(**_autocast_kwargs_for(device)):
                 pred_heatmaps, pred_coords = model(images)
                 loss, _, _, pixel_loss = criterion(
                     pred_heatmaps,
