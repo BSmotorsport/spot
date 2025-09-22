@@ -733,10 +733,24 @@ class HeatmapHead(nn.Module):
 
         fused_high_res = fpn_results[0]
 
+        fused_high_res = torch.nan_to_num(
+            fused_high_res,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
         decoder_input = fused_high_res.to(dtype=torch.float32)
         device_type = decoder_input.device.type
         with autocast(device_type=device_type, enabled=False):
             heatmap = self.decoder(decoder_input)
+
+        heatmap = torch.nan_to_num(
+            heatmap,
+            nan=0.0,
+            posinf=50.0,
+            neginf=-50.0,
+        ).clamp_(-50.0, 50.0)
 
         if heatmap.shape[-1] != Config.HEATMAP_SIZE:
             heatmap = F.interpolate(
@@ -747,8 +761,22 @@ class HeatmapHead(nn.Module):
             )
 
         deepest_feature = self.coord_proj(features[-1])
+        deepest_feature = torch.nan_to_num(
+            deepest_feature,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
         coords_raw = self.coord_regressor(deepest_feature)
+        coords_raw = torch.nan_to_num(
+            coords_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         coords = torch.sigmoid(coords_raw)
+        coords = torch.nan_to_num(coords, nan=0.0, posinf=1.0, neginf=0.0)
 
         return heatmap, coords
 
