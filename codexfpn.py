@@ -194,10 +194,17 @@ def create_target_heatmap(keypoints, size, sigma=None):
 def soft_argmax_2d(heatmap, temperature=1.0):
     """Compute soft-argmax for differentiable coordinate extraction."""
     batch_size, _, height, width = heatmap.shape
-    
+
+    # Stabilize logits before applying softmax to avoid numerical issues
+    heatmap_float = torch.nan_to_num(
+        heatmap.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    heatmap_flat = heatmap_float.view(batch_size, -1)
+    max_val, _ = torch.max(heatmap_flat, dim=1, keepdim=True)
+    stable_heatmap = heatmap_flat - max_val
+
     # Apply softmax to get probabilities
-    heatmap_flat = heatmap.view(batch_size, -1)
-    heatmap_probs = F.softmax(heatmap_flat / temperature, dim=1)
+    heatmap_probs = F.softmax(stable_heatmap / temperature, dim=1)
     heatmap_probs = heatmap_probs.view(batch_size, 1, height, width)
     
     # Create coordinate grids normalized to [0, 1]
@@ -212,6 +219,7 @@ def soft_argmax_2d(heatmap, temperature=1.0):
     y_expected = torch.sum(heatmap_probs * yy, dim=(2, 3))
 
     coords = torch.stack([x_expected.squeeze(1), y_expected.squeeze(1)], dim=1)
+    coords = torch.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Scale back to pixel coordinates
     width_range = width - 1 if width > 1 else 0
@@ -439,6 +447,25 @@ class CombinedLoss(nn.Module):
         with autocast(device_type=device_type, enabled=False):
             pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
             target_heatmaps_fp32 = target_heatmaps.to(dtype=torch.float32)
+
+            # Heatmap logits can overflow to +/-inf when the decoder runs in
+            # half precision during fine-tuning.  Sanitise them here so that
+            # BCE-with-logits never receives non-finite values, which would
+            # otherwise trigger the "Non-finite loss encountered" guard in the
+            # training loop.
+            pred_heatmaps_fp32 = torch.nan_to_num(
+                pred_heatmaps_fp32,
+                nan=0.0,
+                posinf=50.0,
+                neginf=-50.0,
+            ).clamp_(-50.0, 50.0)
+
+            target_heatmaps_fp32 = torch.nan_to_num(
+                target_heatmaps_fp32,
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            )
 
             # Switch to a logits-based loss that dramatically up-weights pixels near the
             # bright center of the Gaussian target.  This keeps background regions from
@@ -705,7 +732,11 @@ class HeatmapHead(nn.Module):
 
 
         fused_high_res = fpn_results[0]
-        heatmap = self.decoder(fused_high_res)
+
+        decoder_input = fused_high_res.to(dtype=torch.float32)
+        device_type = decoder_input.device.type
+        with autocast(device_type=device_type, enabled=False):
+            heatmap = self.decoder(decoder_input)
 
         if heatmap.shape[-1] != Config.HEATMAP_SIZE:
             heatmap = F.interpolate(
