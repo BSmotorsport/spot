@@ -448,6 +448,25 @@ class CombinedLoss(nn.Module):
             pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
             target_heatmaps_fp32 = target_heatmaps.to(dtype=torch.float32)
 
+            # Heatmap logits can overflow to +/-inf when the decoder runs in
+            # half precision during fine-tuning.  Sanitise them here so that
+            # BCE-with-logits never receives non-finite values, which would
+            # otherwise trigger the "Non-finite loss encountered" guard in the
+            # training loop.
+            pred_heatmaps_fp32 = torch.nan_to_num(
+                pred_heatmaps_fp32,
+                nan=0.0,
+                posinf=50.0,
+                neginf=-50.0,
+            ).clamp_(-50.0, 50.0)
+
+            target_heatmaps_fp32 = torch.nan_to_num(
+                target_heatmaps_fp32,
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            )
+
             # Switch to a logits-based loss that dramatically up-weights pixels near the
             # bright center of the Gaussian target.  This keeps background regions from
             # dominating the objective while still benefiting from numerically stable
@@ -713,7 +732,11 @@ class HeatmapHead(nn.Module):
 
 
         fused_high_res = fpn_results[0]
-        heatmap = self.decoder(fused_high_res)
+
+        decoder_input = fused_high_res.to(dtype=torch.float32)
+        device_type = decoder_input.device.type
+        with autocast(device_type=device_type, enabled=False):
+            heatmap = self.decoder(decoder_input)
 
         if heatmap.shape[-1] != Config.HEATMAP_SIZE:
             heatmap = F.interpolate(
