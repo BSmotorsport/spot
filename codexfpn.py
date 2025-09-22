@@ -486,12 +486,18 @@ class CombinedLoss(nn.Module):
             # prediction-dependent modulation.
             weight = (bright_weight * (1.0 + focal_modulation)).detach()
 
+            # Normalise the loss by the effective weight rather than the number of pixels.
+            # This keeps the magnitude tied to the amount of foreground signal instead of
+            # being diluted by the vast background region of the heatmap.
             h_loss = F.binary_cross_entropy_with_logits(
                 pred_heatmaps_fp32,
                 target_clamped,
                 weight=weight,
-                reduction='mean',
+                reduction='sum',
             )
+
+            normaliser = weight.sum().clamp_min(1e-6)
+            h_loss = h_loss / normaliser
 
             total_loss = self.heatmap_weight * h_loss
             c_loss = pred_heatmaps_fp32.new_tensor(0.0)
