@@ -809,6 +809,9 @@ def train_one_epoch(
     num_batches = len(dataloader)
     optimizer.zero_grad(set_to_none=True)
 
+    accumulation_counter = 0
+    processed_batches = 0
+
     progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", colour="green")
 
     if use_mixup is None:
@@ -859,7 +862,7 @@ def train_one_epoch(
         if not torch.isfinite(loss):
             print("\n⚠️ Non-finite loss encountered, skipping batch to protect training stability.")
             optimizer.zero_grad(set_to_none=True)
-            scaler.update()
+            accumulation_counter = 0
             continue
 
         total_loss += loss.item()
@@ -867,11 +870,15 @@ def train_one_epoch(
         total_coord_loss += c_loss.item()
         total_pixel_loss += p_loss.item()
 
+        processed_batches += 1
+
         scaled_loss = loss / grad_accum_steps
         scaler.scale(scaled_loss).backward()
 
-        should_step = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == num_batches
-        if should_step:
+        accumulation_counter += 1
+
+        should_step = accumulation_counter >= grad_accum_steps or (batch_idx + 1) == num_batches
+        if should_step and accumulation_counter > 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -884,6 +891,7 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            accumulation_counter = 0
 
         progress_bar.set_postfix(
             {
@@ -894,10 +902,12 @@ def train_one_epoch(
             }
         )
 
-    avg_loss = total_loss / num_batches
-    avg_h_loss = total_heatmap_loss / num_batches
-    avg_c_loss = total_coord_loss / num_batches
-    avg_p_loss = total_pixel_loss / num_batches
+    effective_batches = max(processed_batches, 1)
+
+    avg_loss = total_loss / effective_batches
+    avg_h_loss = total_heatmap_loss / effective_batches
+    avg_c_loss = total_coord_loss / effective_batches
+    avg_p_loss = total_pixel_loss / effective_batches
 
     return avg_loss, avg_h_loss, avg_c_loss, avg_p_loss
 
