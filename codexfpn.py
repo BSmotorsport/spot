@@ -62,11 +62,12 @@ class Config:
     ENABLE_MIXUP = False  # Disable by default for single-keypoint stability
 
     # Fusion gate tuning
-    HEATMAP_CONFIDENCE_THRESHOLD = 0.65  # Confidence needed before heavily trusting heatmap coords
+    HEATMAP_CONFIDENCE_THRESHOLD = 0.38  # Confidence needed before heavily trusting heatmap coords
     HEATMAP_CONFIDENCE_SCALE = 1.0  # Linear scaling factor for heatmap fusion weights
     HEATMAP_MIN_FUSION_WEIGHT = 0.15  # Always leave some weight on the regressor branch
     HEATMAP_CONFIDENCE_WARMUP_EPOCHS = 5  # Gradually enable the gate after unfreezing
-    HEATMAP_CONFIDENCE_GAMMA = 1.5  # Sharpen confidence response once above threshold
+    HEATMAP_CONFIDENCE_GAMMA = 1.0  # Linear confidence response to avoid over-suppressing mid peaks
+    HEATMAP_CONFIDENCE_DEBUG = False  # Enable to log per-batch confidence stats for tuning
 
     # Loss weighting
     HEATMAP_LOSS_WEIGHT = 0.55
@@ -283,6 +284,30 @@ def compute_heatmap_fusion_weight(heatmap_logits, epoch=None):
             weight = weight * Config.HEATMAP_CONFIDENCE_SCALE
 
         weight = torch.clamp(weight, min=min_weight, max=1.0)
+
+        if Config.HEATMAP_CONFIDENCE_DEBUG:
+            debug_stack = torch.stack((peak, mean, confidence, weight), dim=1)
+            debug_cpu = debug_stack.detach().cpu()
+            sample_count = debug_cpu.size(0)
+            preview_count = min(3, sample_count)
+
+            for idx in range(preview_count):
+                peak_v, mean_v, conf_v, weight_v = debug_cpu[idx].tolist()
+                print(
+                    "[heatmap gate] sample"
+                    f" {idx}: peak={peak_v:.3f}, mean={mean_v:.3f}, "
+                    f"confidence={conf_v:.3f}, weight={weight_v:.3f}"
+                )
+
+            if sample_count > preview_count:
+                print(f"[heatmap gate] ... {sample_count - preview_count} more samples in batch")
+
+            batch_means = debug_cpu.mean(dim=0)
+            print(
+                "[heatmap gate] batch_mean: "
+                f"peak={batch_means[0]:.3f}, mean={batch_means[1]:.3f}, "
+                f"confidence={batch_means[2]:.3f}, weight={batch_means[3]:.3f}"
+            )
 
     return weight
 
