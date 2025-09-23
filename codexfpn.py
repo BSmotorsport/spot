@@ -190,10 +190,12 @@ def create_target_heatmap(keypoints, size, sigma=None):
     if heatmap.max() > 0:
         heatmap = heatmap / heatmap.max()
 
-    # Blend with a uniform floor to provide label smoothing and avoid
-    # overly-peaked targets that can destabilise the loss when
-    # comparing batches between training and validation.
-    heatmap = heatmap * 0.98 + 0.01
+    # Blend with a very small uniform floor to provide label smoothing
+    # while keeping the background pixels below the foreground mask
+    # threshold used in the loss.  Distribute the smoothing mass across
+    # all pixels so that the effective offset per pixel is tiny.
+    smoothing = 0.02
+    heatmap = heatmap * (1.0 - smoothing) + smoothing / (size * size)
 
     return heatmap
 
