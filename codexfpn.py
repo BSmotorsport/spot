@@ -474,30 +474,39 @@ class CombinedLoss(nn.Module):
             prob = torch.sigmoid(pred_heatmaps_fp32)
 
             target_clamped = target_heatmaps_fp32.clamp(0.0, 1.0)
-            bright_weight = 1.0 + 99.0 * target_clamped
-            focal_modulation = torch.where(
-                target_clamped > 0.01,
-                (1.0 - prob).pow(2.0),
-                prob.pow(2.0),
-            )
-            # Detach the dynamically generated weight tensor.  BCE-with-logits does not
-            # support gradient propagation through the ``weight`` argument, so we ensure
-            # it remains a statically valued tensor while still reflecting the latest
-            # prediction-dependent modulation.
-            weight = (bright_weight * (1.0 + focal_modulation)).detach()
+            foreground_mask = (target_clamped > 0.01).to(dtype=pred_heatmaps_fp32.dtype)
+            background_mask = 1.0 - foreground_mask
 
-            # Normalise the loss by the effective weight rather than the number of pixels.
-            # This keeps the magnitude tied to the amount of foreground signal instead of
-            # being diluted by the vast background region of the heatmap.
-            h_loss = F.binary_cross_entropy_with_logits(
+            # Build separate modulation terms for foreground and background pixels.  The
+            # foreground branch receives a strong boost near the Gaussian peak, while the
+            # background keeps a gentle focal-style penalty to suppress spurious blobs.
+            bright_weight = 1.0 + 99.0 * target_clamped
+            foreground_focus = 1.0 + (1.0 - prob).pow(2.0)
+            background_focus = 1.0 + prob.pow(2.0)
+
+            pixel_weight = torch.where(
+                foreground_mask > 0.0,
+                bright_weight * foreground_focus,
+                background_focus,
+            ).detach()
+
+            per_pixel_loss = F.binary_cross_entropy_with_logits(
                 pred_heatmaps_fp32,
                 target_clamped,
-                weight=weight,
-                reduction='sum',
+                reduction='none',
             )
 
-            normaliser = weight.sum().clamp_min(1e-6)
-            h_loss = h_loss / normaliser
+            foreground_weight = (pixel_weight * foreground_mask).sum().clamp_min(1e-6)
+            background_weight = (pixel_weight * background_mask).sum().clamp_min(1e-6)
+
+            foreground_loss = (
+                per_pixel_loss * pixel_weight * foreground_mask
+            ).sum() / foreground_weight
+            background_loss = (
+                per_pixel_loss * pixel_weight * background_mask
+            ).sum() / background_weight
+
+            h_loss = 0.5 * (foreground_loss + background_loss)
 
             total_loss = self.heatmap_weight * h_loss
             c_loss = pred_heatmaps_fp32.new_tensor(0.0)
