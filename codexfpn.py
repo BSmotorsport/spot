@@ -73,6 +73,7 @@ class Config:
     HEATMAP_LOSS_WEIGHT = 0.55
     COORD_LOSS_WEIGHT = 0.25
     PIXEL_COORD_LOSS_WEIGHT = 0.20
+    PIXEL_LOSS_LOG_SCALE = 75.0  # Damp extreme pixel errors so a bad batch can't destabilise training
 
     # Memory optimization flags
     ENABLE_GRAD_CHECKPOINTING = True
@@ -556,8 +557,23 @@ class CombinedLoss(nn.Module):
                     image_extent = float(Config.IMAGE_SIZE - 1)
                     pred_pixels = pred_coords_fp32 * image_extent
                     target_pixels = target_coords_fp32 * image_extent
-                    pixel_loss = torch.mean(torch.abs(pred_pixels - target_pixels))
-                    total_loss = total_loss + self.pixel_coord_weight * pixel_loss
+
+                    pixel_abs_error = torch.abs(pred_pixels - target_pixels)
+                    pixel_loss = pixel_abs_error.mean()
+
+                    loss_term = pixel_loss
+                    log_scale = float(Config.PIXEL_LOSS_LOG_SCALE)
+                    if log_scale > 0.0:
+                        # Use a log-shaped penalty to prevent extreme outliers from
+                        # overwhelming the optimiser.  For large errors the gradient
+                        # magnitude now decays roughly as 1 / error, which keeps the
+                        # update gentle while still nudging the regressor back towards
+                        # the target.
+                        loss_term = (
+                            torch.log1p(pixel_abs_error / log_scale).mean() * log_scale
+                        )
+
+                    total_loss = total_loss + self.pixel_coord_weight * loss_term
 
         return total_loss, h_loss, c_loss, pixel_loss
 
