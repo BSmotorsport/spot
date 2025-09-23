@@ -189,7 +189,12 @@ def create_target_heatmap(keypoints, size, sigma=None):
     # Normalize to [0, 1] if there's any signal
     if heatmap.max() > 0:
         heatmap = heatmap / heatmap.max()
-        
+
+    # Blend with a uniform floor to provide label smoothing and avoid
+    # overly-peaked targets that can destabilise the loss when
+    # comparing batches between training and validation.
+    heatmap = heatmap * 0.98 + 0.01
+
     return heatmap
 
 def soft_argmax_2d(heatmap, temperature=1.0):
