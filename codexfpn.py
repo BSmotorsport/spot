@@ -73,6 +73,8 @@ class Config:
     HEATMAP_LOSS_WEIGHT = 0.55
     COORD_LOSS_WEIGHT = 0.25
     PIXEL_COORD_LOSS_WEIGHT = 0.20
+    HEATMAP_CENTER_LOSS_WEIGHT = 0.05  # Encourage the heatmap peak to stay anchored on the target
+    HEATMAP_CENTER_TEMPERATURE = 0.75  # Sharper soft-argmax for the center consistency loss
     PIXEL_LOSS_LOG_SCALE = 75.0  # Damp extreme pixel errors so a bad batch can't destabilise training
 
     # Memory optimization flags
@@ -474,12 +476,18 @@ class CombinedLoss(nn.Module):
         self.coord_weight = (
             Config.COORD_LOSS_WEIGHT if coord_weight is None else float(coord_weight)
         )
+        self.heatmap_center_weight = float(Config.HEATMAP_CENTER_LOSS_WEIGHT)
+        self.heatmap_center_temperature = max(float(Config.HEATMAP_CENTER_TEMPERATURE), 1e-3)
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         device_type = pred_heatmaps.device.type
         with autocast(device_type=device_type, enabled=False):
             pred_heatmaps_fp32 = pred_heatmaps.to(dtype=torch.float32)
             target_heatmaps_fp32 = target_heatmaps.to(dtype=torch.float32)
+
+            target_coords_fp32 = None
+            if target_coords is not None:
+                target_coords_fp32 = target_coords.to(dtype=torch.float32)
 
             # Heatmap logits can overflow to +/-inf when the decoder runs in
             # half precision during fine-tuning.  Sanitise them here so that
@@ -544,10 +552,35 @@ class CombinedLoss(nn.Module):
             total_loss = self.heatmap_weight * h_loss
             c_loss = pred_heatmaps_fp32.new_tensor(0.0)
             pixel_loss = pred_heatmaps_fp32.new_tensor(0.0)
+            center_loss = pred_heatmaps_fp32.new_tensor(0.0)
 
-            if pred_coords is not None and target_coords is not None:
+            if (
+                self.heatmap_center_weight > 0.0
+                and target_coords_fp32 is not None
+                and pred_heatmaps_fp32.shape[-1] > 1
+                and pred_heatmaps_fp32.shape[-2] > 1
+            ):
+                center_coords = soft_argmax_2d(
+                    pred_heatmaps_fp32,
+                    temperature=self.heatmap_center_temperature,
+                )
+                width_range = float(pred_heatmaps_fp32.shape[-1] - 1)
+                height_range = float(pred_heatmaps_fp32.shape[-2] - 1)
+                target_heatmap_coords = torch.stack(
+                    (
+                        target_coords_fp32[:, 0] * width_range,
+                        target_coords_fp32[:, 1] * height_range,
+                    ),
+                    dim=1,
+                )
+                center_loss = F.smooth_l1_loss(
+                    center_coords,
+                    target_heatmap_coords,
+                )
+                total_loss = total_loss + self.heatmap_center_weight * center_loss
+
+            if pred_coords is not None and target_coords_fp32 is not None:
                 pred_coords_fp32 = pred_coords.to(dtype=torch.float32)
-                target_coords_fp32 = target_coords.to(dtype=torch.float32)
                 c_loss = self.coord_loss(pred_coords_fp32, target_coords_fp32)
 
                 if self.coord_weight > 0.0:
@@ -575,7 +608,7 @@ class CombinedLoss(nn.Module):
 
                     total_loss = total_loss + self.pixel_coord_weight * loss_term
 
-        return total_loss, h_loss, c_loss, pixel_loss
+        return total_loss, h_loss, c_loss, pixel_loss, center_loss
 
 
 def _make_group_norm(num_channels, max_groups=32):
@@ -939,6 +972,7 @@ def train_one_epoch(
     total_heatmap_loss = 0.0
     total_coord_loss = 0.0
     total_pixel_loss = 0.0
+    total_center_loss = 0.0
 
     num_batches = len(dataloader)
     optimizer.zero_grad(set_to_none=True)
@@ -979,18 +1013,19 @@ def train_one_epoch(
             pred_heatmaps, pred_coords = model(images)
 
             if target_b is not None and coords_b is not None:
-                loss_a, h_loss_a, c_loss_a, p_loss_a = criterion(
+                loss_a, h_loss_a, c_loss_a, p_loss_a, ctr_loss_a = criterion(
                     pred_heatmaps, target_a, pred_coords, coords_a
                 )
-                loss_b, h_loss_b, c_loss_b, p_loss_b = criterion(
+                loss_b, h_loss_b, c_loss_b, p_loss_b, ctr_loss_b = criterion(
                     pred_heatmaps, target_b, pred_coords, coords_b
                 )
                 loss = lam * loss_a + (1 - lam) * loss_b
                 h_loss = lam * h_loss_a + (1 - lam) * h_loss_b
                 c_loss = lam * c_loss_a + (1 - lam) * c_loss_b
                 p_loss = lam * p_loss_a + (1 - lam) * p_loss_b
+                center_loss = lam * ctr_loss_a + (1 - lam) * ctr_loss_b
             else:
-                loss, h_loss, c_loss, p_loss = criterion(
+                loss, h_loss, c_loss, p_loss, center_loss = criterion(
                     pred_heatmaps, target_a, pred_coords, coords_a
                 )
 
@@ -1005,6 +1040,7 @@ def train_one_epoch(
         total_heatmap_loss += h_loss.item()
         total_coord_loss += c_loss.item()
         total_pixel_loss += p_loss.item()
+        total_center_loss += center_loss.item()
 
         processed_batches += 1
 
@@ -1037,6 +1073,7 @@ def train_one_epoch(
                 'h_loss': f"{h_loss.item():.4f}",
                 'c_loss': f"{c_loss.item():.4f}",
                 'p_loss': f"{p_loss.item():.4f}",
+                'ctr': f"{center_loss.item():.4f}",
             }
         )
 
@@ -1046,8 +1083,9 @@ def train_one_epoch(
     avg_h_loss = total_heatmap_loss / effective_batches
     avg_c_loss = total_coord_loss / effective_batches
     avg_p_loss = total_pixel_loss / effective_batches
+    avg_ctr_loss = total_center_loss / effective_batches
 
-    return avg_loss, avg_h_loss, avg_c_loss, avg_p_loss
+    return avg_loss, avg_h_loss, avg_c_loss, avg_p_loss, avg_ctr_loss
 
 def validate(model, dataloader, criterion, device, epoch):
     """Validate the model and compute metrics."""
@@ -1058,6 +1096,7 @@ def validate(model, dataloader, criterion, device, epoch):
     all_errors = []
     fusion_weight_log = []
     total_pixel_loss = 0.0
+    total_center_loss = 0.0
 
     progress_bar = tqdm(dataloader, desc=f"Validation Epoch {epoch+1}", colour="yellow")
 
@@ -1076,7 +1115,7 @@ def validate(model, dataloader, criterion, device, epoch):
             # Forward pass
             with autocast(**_autocast_kwargs_for(device)):
                 pred_heatmaps, pred_coords = model(images)
-                loss, _, _, pixel_loss = criterion(
+                loss, _, _, pixel_loss, center_loss = criterion(
                     pred_heatmaps,
                     target_heatmaps,
                     pred_coords,
@@ -1085,6 +1124,7 @@ def validate(model, dataloader, criterion, device, epoch):
 
             total_loss += loss.item()
             total_pixel_loss += pixel_loss.item()
+            total_center_loss += center_loss.item()
             
             # Extract coordinates from heatmap for evaluation
             heatmap_coords = get_coords_from_heatmap(pred_heatmaps, method='soft_argmax')
@@ -1129,6 +1169,7 @@ def validate(model, dataloader, criterion, device, epoch):
     # Aggregate metrics
     avg_loss = total_loss / len(dataloader)
     avg_pixel_loss = total_pixel_loss / len(dataloader)
+    avg_center_loss = total_center_loss / len(dataloader)
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     
@@ -1161,6 +1202,7 @@ def validate(model, dataloader, criterion, device, epoch):
         all_errors,
         {
             'pixel_loss': avg_pixel_loss,
+            'center_loss': avg_center_loss,
             'heatmap_mae': mae_heatmap,
             'regressor_mae': mae_regressor,
             'fusion_weight': np.mean(fusion_weight_log) if fusion_weight_log else 0.0,
@@ -1425,9 +1467,11 @@ def main():
     start_epoch = 0
     history = {
         'train_loss': [],
+        'train_center_loss': [],
         'val_loss': [],
         'val_mae': [],
         'val_rmse': [],
+        'val_center_loss': [],
         'lr': []
     }
     
@@ -1479,6 +1523,8 @@ def main():
         best_val_rmse = checkpoint.get('best_val_rmse', float('inf'))
         if 'history' in checkpoint:
             history = checkpoint['history']
+        for key in ('train_center_loss', 'val_center_loss'):
+            history.setdefault(key, [])
 
         def _safe_load_optimizer(opt, opt_state):
             if not opt_state:
@@ -1581,7 +1627,7 @@ def main():
         print(f"Learning rates: {lr_report}")
 
         # Training phase
-        train_loss, train_h_loss, train_c_loss, train_p_loss = train_one_epoch(
+        train_loss, train_h_loss, train_c_loss, train_p_loss, train_ctr_loss = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -1601,20 +1647,24 @@ def main():
 
             # Save metrics
             history['train_loss'].append(train_loss)
+            history['train_center_loss'].append(train_ctr_loss)
             history['val_loss'].append(val_loss)
             history['val_mae'].append(val_mae)
             history['val_rmse'].append(val_rmse)
+            history['val_center_loss'].append(val_stats['center_loss'])
             history['lr'].append([group['lr'] for group in optimizer.param_groups])
-            
+
             # Print epoch summary
             print(f"\n📊 Epoch {epoch+1} Summary:")
             print(
                 "  Train Loss: "
-                f"{train_loss:.4f} (H: {train_h_loss:.4f}, C: {train_c_loss:.4f}, Px: {train_p_loss:.4f})"
+                f"{train_loss:.4f} (H: {train_h_loss:.4f}, C: {train_c_loss:.4f}, "
+                f"Px: {train_p_loss:.4f}, Ctr: {train_ctr_loss:.4f})"
             )
             print(
                 "  Val Loss: "
                 f"{val_loss:.4f} (Px: {val_stats['pixel_loss']:.4f}, "
+                f"Ctr: {val_stats['center_loss']:.4f}, "
                 f"HM-MAE: {val_stats['heatmap_mae']:.2f}px, Reg-MAE: {val_stats['regressor_mae']:.2f}px, "
                 f"w_hm: {val_stats['fusion_weight']:.2f})"
             )
