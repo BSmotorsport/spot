@@ -173,12 +173,20 @@ def instantiate_albumentations_transform(transform_cls, common_kwargs, candidate
     errors: list[str] = []
     for candidate_kwargs in candidate_kwargs_list:
         filtered_kwargs = candidate_kwargs
+        dropped_all_kwargs = False
         if allowed_keys is not None:
             filtered_kwargs = {
                 key: value
                 for key, value in candidate_kwargs.items()
                 if key in allowed_keys
             }
+            dropped_all_kwargs = bool(candidate_kwargs) and not filtered_kwargs
+
+        if dropped_all_kwargs:
+            # The candidate only contained unsupported kwargs.  Skip straight to
+            # the next option rather than instantiating the transform with just
+            # the common arguments.
+            continue
 
         try:
             return transform_cls(**common_kwargs, **filtered_kwargs)
