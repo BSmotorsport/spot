@@ -5,6 +5,7 @@ import random
 import re
 import math
 from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 import torch
@@ -463,7 +464,7 @@ class AdaptiveTuningController:
         val_stats: dict[str, float],
         criterion: "CombinedLoss",
         optimizer: optim.Optimizer | None = None,
-        scheduler: "WarmupCosineLR" | None = None,
+        scheduler: Optional["WarmupCosineLR"] = None,
     ) -> None:
         if not Config.ADAPTIVE_TUNING_ENABLED:
             return
