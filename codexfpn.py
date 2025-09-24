@@ -1665,15 +1665,25 @@ def main():
     # -------------------------------------------------------------------------
     # 2. Create data augmentation pipelines
     # -------------------------------------------------------------------------
+    try:
+        random_resized_crop = A.RandomResizedCrop(
+            size=(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+            scale=(0.55, 1.0),
+            ratio=(0.75, 1.33),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    except (TypeError, ValueError):
+        random_resized_crop = A.RandomResizedCrop(
+            height=Config.IMAGE_SIZE,
+            width=Config.IMAGE_SIZE,
+            scale=(0.55, 1.0),
+            ratio=(0.75, 1.33),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
     train_transform = A.Compose([
         A.OneOf([
-            A.RandomResizedCrop(
-                Config.IMAGE_SIZE,
-                Config.IMAGE_SIZE,
-                scale=(0.55, 1.0),
-                ratio=(0.75, 1.33),
-                interpolation=cv2.INTER_CUBIC,
-            ),
+            random_resized_crop,
             A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
         ], p=1.0),
         A.HorizontalFlip(p=0.5),
