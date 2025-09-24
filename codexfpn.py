@@ -262,13 +262,16 @@ def mixup_data(images, heatmaps, coords, alpha=0.2):
 
     return images, heatmaps, None, coords, None, 1.0
 
-def create_target_heatmap(keypoints, size, sigma=None):
+def create_target_heatmap(keypoints, size, sigma=None, smoothing=None):
     """Create Gaussian heatmap for keypoints with proper normalization."""
     if sigma is None:
         sigma = Config.HEATMAP_SIGMA_START
-        
+
+    if smoothing is None:
+        smoothing = Config.HEATMAP_LABEL_SMOOTHING
+
     heatmap = np.zeros((size, size), dtype=np.float32)
-    
+
     for x, y in keypoints:
         # Skip invalid keypoints
         if x < 0 or x >= size or y < 0 or y >= size:
@@ -294,7 +297,7 @@ def create_target_heatmap(keypoints, size, sigma=None):
     # while keeping the background pixels below the foreground mask
     # threshold used in the loss.  Distribute the smoothing mass across
     # all pixels so that the effective offset per pixel is tiny.
-    smoothing = float(ADAPTIVE_STATE.label_smoothing)
+    smoothing = float(smoothing)
     heatmap = heatmap * (1.0 - smoothing) + smoothing / (size * size)
 
     return heatmap
@@ -435,6 +438,7 @@ class AdaptiveTuningController:
     ) -> float:
         sigma = self.state.sigma_for_epoch(epoch)
         dataset.set_heatmap_sigma(sigma)
+        dataset.set_label_smoothing(self.state.label_smoothing)
         self.state.apply_to_criterion(criterion)
         return sigma
 
@@ -601,12 +605,18 @@ class FootballDataset(Dataset):
         heatmap_size=192,
         augment=True,
         heatmap_sigma=None,
+        label_smoothing=None,
     ):
         self.image_paths = image_paths
         self.transform = transform
         self.heatmap_size = heatmap_size
         self.augment = augment
         self.heatmap_sigma = heatmap_sigma if heatmap_sigma is not None else Config.HEATMAP_SIGMA_START
+        self.label_smoothing = (
+            Config.HEATMAP_LABEL_SMOOTHING
+            if label_smoothing is None
+            else float(label_smoothing)
+        )
         
         # Pre-filter valid images
         self.valid_paths = []
@@ -679,15 +689,19 @@ class FootballDataset(Dataset):
             heatmap_keypoints,
             self.heatmap_size,
             sigma=self.heatmap_sigma,
+            smoothing=self.label_smoothing,
         )
 
         # Store precise coordinates for direct regression (normalized to [0, 1])
         precise_coords = torch.tensor(keypoints[0], dtype=torch.float32) / (Config.IMAGE_SIZE - 1)
-        
+
         return image, torch.from_numpy(target_heatmap).unsqueeze(0), precise_coords
 
     def set_heatmap_sigma(self, sigma):
         self.heatmap_sigma = float(sigma)
+
+    def set_label_smoothing(self, smoothing):
+        self.label_smoothing = float(smoothing)
 
 
 def compute_sigma_for_epoch(epoch):
@@ -1912,6 +1926,7 @@ def main():
     for epoch in range(start_epoch, Config.EPOCHS):
         current_sigma = adaptive_controller.on_epoch_start(epoch, train_dataset, criterion)
         val_dataset.set_heatmap_sigma(current_sigma)
+        val_dataset.set_label_smoothing(ADAPTIVE_STATE.label_smoothing)
         if (epoch % 5 == 0) or (epoch < 5):
             print(
                 f"Using heatmap sigma {current_sigma:.2f} and smoothing "
