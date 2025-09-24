@@ -56,31 +56,53 @@ class Config:
     WING_W = 5.0
     WING_EPSILON = 0.5
     HEATMAP_SIGMA_START = 10.0  # Start with a broader Gaussian for denser early gradients
-    HEATMAP_SIGMA_END = 4.0     # Anneal towards a sharper target later in training
+    HEATMAP_SIGMA_END = 3.5     # Anneal towards a sharper target later in training
+    HEATMAP_SIGMA_MIN = 2.0     # Allow adaptive tuning to push the target sharper when needed
     HEATMAP_SIGMA_DECAY_EPOCHS = 50
     MIXUP_ALPHA = 0.2  # Mixup augmentation strength
     ENABLE_MIXUP = False  # Disable by default for single-keypoint stability
 
     # Fusion gate tuning
-    HEATMAP_CONFIDENCE_THRESHOLD = 0.38  # Confidence needed before heavily trusting heatmap coords
+    HEATMAP_CONFIDENCE_THRESHOLD = 0.5   # Confidence needed before heavily trusting heatmap coords
     HEATMAP_CONFIDENCE_SCALE = 1.0  # Linear scaling factor for heatmap fusion weights
-    HEATMAP_MIN_FUSION_WEIGHT = 0.15  # Always leave some weight on the regressor branch
+    HEATMAP_MIN_FUSION_WEIGHT = 0.1   # Always leave some weight on the regressor branch
+    HEATMAP_MIN_FUSION_WEIGHT_MIN = 0.05
     HEATMAP_CONFIDENCE_WARMUP_EPOCHS = 5  # Gradually enable the gate after unfreezing
-    HEATMAP_CONFIDENCE_GAMMA = 1.0  # Linear confidence response to avoid over-suppressing mid peaks
+    HEATMAP_CONFIDENCE_GAMMA = 1.5  # Emphasise confident peaks before handing control to the heatmap
     HEATMAP_CONFIDENCE_DEBUG = False  # Enable to log per-batch confidence stats for tuning
 
     # Loss weighting
-    HEATMAP_LOSS_WEIGHT = 0.55
-    COORD_LOSS_WEIGHT = 0.25
-    PIXEL_COORD_LOSS_WEIGHT = 0.20
+    HEATMAP_LOSS_WEIGHT = 0.5
+    HEATMAP_LOSS_WEIGHT_MIN = 0.35
+    COORD_LOSS_WEIGHT = 0.3
+    COORD_LOSS_WEIGHT_MAX = 0.45
+    PIXEL_COORD_LOSS_WEIGHT = 0.2
+    PIXEL_COORD_LOSS_WEIGHT_MAX = 0.35
     HEATMAP_CENTER_LOSS_WEIGHT = 0.05  # Encourage the heatmap peak to stay anchored on the target
-    HEATMAP_CENTER_TEMPERATURE = 0.75  # Sharper soft-argmax for the center consistency loss
+    HEATMAP_CENTER_TEMPERATURE = 0.6   # Sharper soft-argmax for the center consistency loss
+    HEATMAP_CENTER_TEMPERATURE_MIN = 0.35
     PIXEL_LOSS_LOG_SCALE = 75.0  # Damp extreme pixel errors so a bad batch can't destabilise training
+
+    HEATMAP_LABEL_SMOOTHING = 0.01
+    HEATMAP_LABEL_SMOOTHING_MIN = 0.002
 
     # Memory optimization flags
     ENABLE_GRAD_CHECKPOINTING = True
     USE_CHANNELS_LAST = True
-    
+
+    # Adaptive tuning parameters
+    ADAPTIVE_TUNING_ENABLED = True
+    ADAPTIVE_PATIENCE = 6
+    ADAPTIVE_IMPROVEMENT_TOLERANCE = 1.0  # Require at least this MAE gain to reset patience
+    ADAPTIVE_BRANCH_MARGIN = 5.0  # Margin (in px) used to judge which branch under-performs
+    ADAPTIVE_SIGMA_DECAY = 0.85
+    ADAPTIVE_SMOOTHING_DECAY = 0.5
+    ADAPTIVE_CONFIDENCE_STEP = 0.05
+    ADAPTIVE_FUSION_STEP = 0.02
+    ADAPTIVE_LOSS_WEIGHT_STEP = 0.03
+    ADAPTIVE_CENTER_TEMP_DECAY = 0.85
+    ADAPTIVE_LOGGING = True
+
     # Validation settings
     VALIDATE_EVERY_N_EPOCHS = 1
     SAVE_BEST_ONLY = False
@@ -100,6 +122,81 @@ def set_seeds(seed=42):
         torch.backends.cudnn.benchmark = False
 
 set_seeds(Config.RANDOM_SEED)
+
+# ======================================================================================
+# 1a. ADAPTIVE TRAINING STATE
+# ======================================================================================
+
+
+class AdaptiveState:
+    """Runtime-adjustable hyperparameters shared across the training pipeline."""
+
+    def __init__(self) -> None:
+        self.manual_sigma: float | None = None
+        self.current_sigma: float = float(Config.HEATMAP_SIGMA_START)
+        self.sigma_floor: float = float(Config.HEATMAP_SIGMA_MIN)
+        self.label_smoothing: float = float(Config.HEATMAP_LABEL_SMOOTHING)
+
+        self.heatmap_loss_weight: float = float(Config.HEATMAP_LOSS_WEIGHT)
+        self.coord_loss_weight: float = float(Config.COORD_LOSS_WEIGHT)
+        self.pixel_coord_loss_weight: float = float(Config.PIXEL_COORD_LOSS_WEIGHT)
+        self.center_loss_weight: float = float(Config.HEATMAP_CENTER_LOSS_WEIGHT)
+        self.center_temperature: float = float(Config.HEATMAP_CENTER_TEMPERATURE)
+
+        self.heatmap_confidence_threshold: float = float(Config.HEATMAP_CONFIDENCE_THRESHOLD)
+        self.heatmap_confidence_gamma: float = float(Config.HEATMAP_CONFIDENCE_GAMMA)
+        self.heatmap_min_fusion_weight: float = float(Config.HEATMAP_MIN_FUSION_WEIGHT)
+        self.heatmap_confidence_scale: float = float(Config.HEATMAP_CONFIDENCE_SCALE)
+
+    def sigma_for_epoch(self, epoch: int) -> float:
+        if Config.HEATMAP_SIGMA_DECAY_EPOCHS <= 0:
+            base_sigma = float(Config.HEATMAP_SIGMA_END)
+        else:
+            progress = min(max(epoch, 0) / Config.HEATMAP_SIGMA_DECAY_EPOCHS, 1.0)
+            base_sigma = Config.HEATMAP_SIGMA_START + (
+                Config.HEATMAP_SIGMA_END - Config.HEATMAP_SIGMA_START
+            ) * progress
+
+        if self.manual_sigma is not None:
+            base_sigma = min(base_sigma, self.manual_sigma)
+
+        self.current_sigma = float(max(self.sigma_floor, base_sigma))
+        return self.current_sigma
+
+    def apply_to_criterion(self, criterion: "CombinedLoss") -> None:
+        criterion.set_weights(
+            heatmap_weight=self.heatmap_loss_weight,
+            coord_weight=self.coord_loss_weight,
+            pixel_coord_weight=self.pixel_coord_loss_weight,
+            center_weight=self.center_loss_weight,
+            center_temperature=self.center_temperature,
+        )
+
+    def state_dict(self) -> dict[str, float | None]:
+        return {
+            "manual_sigma": self.manual_sigma,
+            "current_sigma": self.current_sigma,
+            "sigma_floor": self.sigma_floor,
+            "label_smoothing": self.label_smoothing,
+            "heatmap_loss_weight": self.heatmap_loss_weight,
+            "coord_loss_weight": self.coord_loss_weight,
+            "pixel_coord_loss_weight": self.pixel_coord_loss_weight,
+            "center_loss_weight": self.center_loss_weight,
+            "center_temperature": self.center_temperature,
+            "heatmap_confidence_threshold": self.heatmap_confidence_threshold,
+            "heatmap_confidence_gamma": self.heatmap_confidence_gamma,
+            "heatmap_min_fusion_weight": self.heatmap_min_fusion_weight,
+            "heatmap_confidence_scale": self.heatmap_confidence_scale,
+        }
+
+    def load_state_dict(self, state: dict[str, float | None]) -> None:
+        for key, value in state.items():
+            if not hasattr(self, key):
+                continue
+            setattr(self, key, float(value) if value is not None else None)
+
+
+ADAPTIVE_STATE = AdaptiveState()
 
 # ======================================================================================
 # 2. HELPER FUNCTIONS
@@ -197,7 +294,7 @@ def create_target_heatmap(keypoints, size, sigma=None):
     # while keeping the background pixels below the foreground mask
     # threshold used in the loss.  Distribute the smoothing mass across
     # all pixels so that the effective offset per pixel is tiny.
-    smoothing = 0.02
+    smoothing = float(ADAPTIVE_STATE.label_smoothing)
     heatmap = heatmap * (1.0 - smoothing) + smoothing / (size * size)
 
     return heatmap
@@ -270,17 +367,17 @@ def compute_heatmap_fusion_weight(heatmap_logits, epoch=None):
         confidence = (peak - mean) / (peak + 1e-6)
         confidence = torch.nan_to_num(confidence, nan=0.0, posinf=0.0, neginf=0.0)
 
-        threshold = float(Config.HEATMAP_CONFIDENCE_THRESHOLD)
+        threshold = float(ADAPTIVE_STATE.heatmap_confidence_threshold)
         denom = max(1e-6, 1.0 - threshold)
         if threshold >= 1.0:
             gated = torch.zeros_like(confidence)
         else:
             gated = torch.clamp((confidence - threshold) / denom, min=0.0, max=1.0)
 
-        if Config.HEATMAP_CONFIDENCE_GAMMA != 1.0:
-            gated = gated.pow(Config.HEATMAP_CONFIDENCE_GAMMA)
+        if ADAPTIVE_STATE.heatmap_confidence_gamma != 1.0:
+            gated = gated.pow(ADAPTIVE_STATE.heatmap_confidence_gamma)
 
-        min_weight = float(np.clip(Config.HEATMAP_MIN_FUSION_WEIGHT, 0.0, 1.0))
+        min_weight = float(np.clip(ADAPTIVE_STATE.heatmap_min_fusion_weight, 0.0, 1.0))
         weight = min_weight + (1.0 - min_weight) * gated
 
         if epoch is not None and Config.HEATMAP_CONFIDENCE_WARMUP_EPOCHS > 0:
@@ -290,8 +387,8 @@ def compute_heatmap_fusion_weight(heatmap_logits, epoch=None):
             )
             weight = min_weight + (weight - min_weight) * warmup_progress
 
-        if Config.HEATMAP_CONFIDENCE_SCALE != 1.0:
-            weight = weight * Config.HEATMAP_CONFIDENCE_SCALE
+        if ADAPTIVE_STATE.heatmap_confidence_scale != 1.0:
+            weight = weight * ADAPTIVE_STATE.heatmap_confidence_scale
 
         weight = torch.clamp(weight, min=min_weight, max=1.0)
 
@@ -320,6 +417,177 @@ def compute_heatmap_fusion_weight(heatmap_logits, epoch=None):
             )
 
     return weight
+
+
+class AdaptiveTuningController:
+    """Dynamic policy that adjusts supervision and fusion settings during training."""
+
+    def __init__(self, state: AdaptiveState) -> None:
+        self.state = state
+        self.best_val_mae: float = float("inf")
+        self.no_improve_epochs: int = 0
+
+    def on_epoch_start(
+        self,
+        epoch: int,
+        dataset: "FootballDataset",
+        criterion: "CombinedLoss",
+    ) -> float:
+        sigma = self.state.sigma_for_epoch(epoch)
+        dataset.set_heatmap_sigma(sigma)
+        self.state.apply_to_criterion(criterion)
+        return sigma
+
+    def on_validation_end(
+        self,
+        epoch: int,
+        val_mae: float,
+        val_stats: dict[str, float],
+        criterion: "CombinedLoss",
+    ) -> None:
+        if not Config.ADAPTIVE_TUNING_ENABLED:
+            return
+
+        if val_mae + float(Config.ADAPTIVE_IMPROVEMENT_TOLERANCE) < self.best_val_mae:
+            self.best_val_mae = float(val_mae)
+            self.no_improve_epochs = 0
+            return
+
+        self.no_improve_epochs += 1
+        if self.no_improve_epochs < int(Config.ADAPTIVE_PATIENCE):
+            return
+
+        adjustments: list[str] = []
+
+        # Push the target supervision sharper and reduce smoothing if plateaus persist.
+        new_sigma = max(
+            self.state.sigma_floor,
+            self.state.current_sigma * float(Config.ADAPTIVE_SIGMA_DECAY),
+        )
+        if (
+            self.state.manual_sigma is None
+            or new_sigma < self.state.manual_sigma - 1e-6
+        ) and new_sigma < self.state.current_sigma - 1e-6:
+            self.state.manual_sigma = new_sigma
+            adjustments.append(f"heatmap sigma → {new_sigma:.2f}")
+
+        if self.state.label_smoothing > Config.HEATMAP_LABEL_SMOOTHING_MIN + 1e-6:
+            new_smoothing = max(
+                Config.HEATMAP_LABEL_SMOOTHING_MIN,
+                self.state.label_smoothing * float(Config.ADAPTIVE_SMOOTHING_DECAY),
+            )
+            if new_smoothing < self.state.label_smoothing - 1e-6:
+                self.state.label_smoothing = new_smoothing
+                adjustments.append(f"label smoothing → {new_smoothing:.4f}")
+
+        heatmap_mae = float(val_stats.get('heatmap_mae', float('nan')))
+        regressor_mae = float(val_stats.get('regressor_mae', float('nan')))
+
+        if not math.isnan(heatmap_mae) and not math.isnan(regressor_mae):
+            branch_margin = float(Config.ADAPTIVE_BRANCH_MARGIN)
+            if heatmap_mae >= regressor_mae + branch_margin:
+                # Heatmap under-performing: favour regressor supervision and gate tightening.
+                new_thresh = min(
+                    0.99,
+                    self.state.heatmap_confidence_threshold
+                    + float(Config.ADAPTIVE_CONFIDENCE_STEP),
+                )
+                if new_thresh > self.state.heatmap_confidence_threshold + 1e-6:
+                    self.state.heatmap_confidence_threshold = new_thresh
+                    adjustments.append(f"fusion threshold → {new_thresh:.2f}")
+
+                new_min_weight = max(
+                    Config.HEATMAP_MIN_FUSION_WEIGHT_MIN,
+                    self.state.heatmap_min_fusion_weight
+                    - float(Config.ADAPTIVE_FUSION_STEP),
+                )
+                if new_min_weight < self.state.heatmap_min_fusion_weight - 1e-6:
+                    self.state.heatmap_min_fusion_weight = new_min_weight
+                    adjustments.append(f"min fusion weight → {new_min_weight:.2f}")
+
+                new_heatmap_weight = max(
+                    Config.HEATMAP_LOSS_WEIGHT_MIN,
+                    self.state.heatmap_loss_weight
+                    - float(Config.ADAPTIVE_LOSS_WEIGHT_STEP),
+                )
+                if new_heatmap_weight < self.state.heatmap_loss_weight - 1e-6:
+                    self.state.heatmap_loss_weight = new_heatmap_weight
+                    adjustments.append(f"heatmap loss weight → {new_heatmap_weight:.2f}")
+
+                new_coord_weight = min(
+                    Config.COORD_LOSS_WEIGHT_MAX,
+                    self.state.coord_loss_weight
+                    + float(Config.ADAPTIVE_LOSS_WEIGHT_STEP),
+                )
+                if new_coord_weight > self.state.coord_loss_weight + 1e-6:
+                    self.state.coord_loss_weight = new_coord_weight
+                    adjustments.append(f"coord loss weight → {new_coord_weight:.2f}")
+
+                new_pixel_weight = min(
+                    Config.PIXEL_COORD_LOSS_WEIGHT_MAX,
+                    self.state.pixel_coord_loss_weight
+                    + float(Config.ADAPTIVE_LOSS_WEIGHT_STEP),
+                )
+                if new_pixel_weight > self.state.pixel_coord_loss_weight + 1e-6:
+                    self.state.pixel_coord_loss_weight = new_pixel_weight
+                    adjustments.append(f"pixel loss weight → {new_pixel_weight:.2f}")
+
+                new_center_temp = max(
+                    Config.HEATMAP_CENTER_TEMPERATURE_MIN,
+                    self.state.center_temperature
+                    * float(Config.ADAPTIVE_CENTER_TEMP_DECAY),
+                )
+                if new_center_temp < self.state.center_temperature - 1e-6:
+                    self.state.center_temperature = new_center_temp
+                    adjustments.append(f"center temperature → {new_center_temp:.2f}")
+
+            elif regressor_mae >= heatmap_mae + branch_margin:
+                # Regressor lagging: relax fusion gate slightly and favour heatmap loss.
+                new_thresh = max(
+                    0.2,
+                    self.state.heatmap_confidence_threshold
+                    - float(Config.ADAPTIVE_CONFIDENCE_STEP) * 0.5,
+                )
+                if new_thresh < self.state.heatmap_confidence_threshold - 1e-6:
+                    self.state.heatmap_confidence_threshold = new_thresh
+                    adjustments.append(f"fusion threshold → {new_thresh:.2f}")
+
+                new_min_weight = min(
+                    0.5,
+                    self.state.heatmap_min_fusion_weight
+                    + float(Config.ADAPTIVE_FUSION_STEP),
+                )
+                if new_min_weight > self.state.heatmap_min_fusion_weight + 1e-6:
+                    self.state.heatmap_min_fusion_weight = new_min_weight
+                    adjustments.append(f"min fusion weight → {new_min_weight:.2f}")
+
+                new_heatmap_weight = min(
+                    1.0,
+                    self.state.heatmap_loss_weight
+                    + float(Config.ADAPTIVE_LOSS_WEIGHT_STEP),
+                )
+                if new_heatmap_weight > self.state.heatmap_loss_weight + 1e-6:
+                    self.state.heatmap_loss_weight = new_heatmap_weight
+                    adjustments.append(f"heatmap loss weight → {new_heatmap_weight:.2f}")
+
+                new_coord_weight = max(
+                    0.05,
+                    self.state.coord_loss_weight
+                    - float(Config.ADAPTIVE_LOSS_WEIGHT_STEP),
+                )
+                if new_coord_weight < self.state.coord_loss_weight - 1e-6:
+                    self.state.coord_loss_weight = new_coord_weight
+                    adjustments.append(f"coord loss weight → {new_coord_weight:.2f}")
+
+        if adjustments and Config.ADAPTIVE_LOGGING:
+            print("\n🔁 Adaptive tuning triggered:")
+            for item in adjustments:
+                print(f"   • {item}")
+
+        if adjustments:
+            self.state.apply_to_criterion(criterion)
+            self.no_improve_epochs = 0
+            self.best_val_mae = min(self.best_val_mae, float(val_mae))
 
 # ======================================================================================
 # 3. DATASET CLASS
@@ -423,15 +691,8 @@ class FootballDataset(Dataset):
 
 
 def compute_sigma_for_epoch(epoch):
-    """Linearly anneal the target sigma during training for denser early gradients."""
-    if Config.HEATMAP_SIGMA_DECAY_EPOCHS <= 0:
-        return Config.HEATMAP_SIGMA_END
-
-    progress = min(max(epoch, 0) / Config.HEATMAP_SIGMA_DECAY_EPOCHS, 1.0)
-    return (
-        Config.HEATMAP_SIGMA_START
-        + (Config.HEATMAP_SIGMA_END - Config.HEATMAP_SIGMA_START) * progress
-    )
+    """Compatibility wrapper around the adaptive state's sigma schedule."""
+    return ADAPTIVE_STATE.sigma_for_epoch(int(epoch))
 
 # ======================================================================================
 # 4. LOSS FUNCTIONS
@@ -465,19 +726,39 @@ class CombinedLoss(nn.Module):
     ) -> None:
         super().__init__()
         self.coord_loss = nn.SmoothL1Loss()
-        self.pixel_coord_weight = (
+        self.pixel_coord_weight = float(
             Config.PIXEL_COORD_LOSS_WEIGHT
             if pixel_coord_weight is None
             else float(pixel_coord_weight)
         )
-        self.heatmap_weight = (
+        self.heatmap_weight = float(
             Config.HEATMAP_LOSS_WEIGHT if heatmap_weight is None else float(heatmap_weight)
         )
-        self.coord_weight = (
+        self.coord_weight = float(
             Config.COORD_LOSS_WEIGHT if coord_weight is None else float(coord_weight)
         )
         self.heatmap_center_weight = float(Config.HEATMAP_CENTER_LOSS_WEIGHT)
         self.heatmap_center_temperature = max(float(Config.HEATMAP_CENTER_TEMPERATURE), 1e-3)
+
+    def set_weights(
+        self,
+        *,
+        heatmap_weight: float | None = None,
+        coord_weight: float | None = None,
+        pixel_coord_weight: float | None = None,
+        center_weight: float | None = None,
+        center_temperature: float | None = None,
+    ) -> None:
+        if heatmap_weight is not None:
+            self.heatmap_weight = float(heatmap_weight)
+        if coord_weight is not None:
+            self.coord_weight = float(coord_weight)
+        if pixel_coord_weight is not None:
+            self.pixel_coord_weight = float(pixel_coord_weight)
+        if center_weight is not None:
+            self.heatmap_center_weight = float(center_weight)
+        if center_temperature is not None:
+            self.heatmap_center_temperature = max(float(center_temperature), 1e-3)
 
     def forward(self, pred_heatmaps, target_heatmaps, pred_coords=None, target_coords=None):
         device_type = pred_heatmaps.device.type
@@ -608,7 +889,11 @@ class CombinedLoss(nn.Module):
 
                     total_loss = total_loss + self.pixel_coord_weight * loss_term
 
-        return total_loss, h_loss, c_loss, pixel_loss, center_loss
+        outputs = (total_loss, h_loss, c_loss, pixel_loss)
+        if target_coords_fp32 is not None or self.heatmap_center_weight > 0.0:
+            outputs = outputs + (center_loss,)
+
+        return outputs
 
 
 def _make_group_norm(num_channels, max_groups=32):
@@ -1367,11 +1652,29 @@ def main():
     # 2. Create data augmentation pipelines
     # -------------------------------------------------------------------------
     train_transform = A.Compose([
-        A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+        A.OneOf([
+            A.RandomResizedCrop(
+                Config.IMAGE_SIZE,
+                Config.IMAGE_SIZE,
+                scale=(0.55, 1.0),
+                ratio=(0.75, 1.33),
+                interpolation=cv2.INTER_CUBIC,
+            ),
+            A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+        ], p=1.0),
         A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=8, p=0.5, border_mode=cv2.BORDER_REFLECT_101),
-        A.RandomBrightnessContrast(0.2, 0.2, p=0.5),
-        A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.3),
+        A.Affine(
+            scale=(0.9, 1.1),
+            rotate=(-8, 8),
+            shear=(-4, 4),
+            fit_output=False,
+            cval=0,
+            mode=cv2.BORDER_REFLECT_101,
+            p=0.4,
+        ),
+        A.Perspective(scale=(0.02, 0.05), keep_size=True, pad_mode=cv2.BORDER_REFLECT_101, p=0.25),
+        A.RandomBrightnessContrast(0.25, 0.2, p=0.5),
+        A.ColorJitter(0.12, 0.12, 0.12, 0.05, p=0.3),
         A.GaussNoise(p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
@@ -1454,6 +1757,7 @@ def main():
     )
 
     criterion = CombinedLoss().to(Config.DEVICE)
+    ADAPTIVE_STATE.apply_to_criterion(criterion)
 
     scheduler = None
     
@@ -1475,6 +1779,8 @@ def main():
         'lr': []
     }
     
+    adaptive_controller = AdaptiveTuningController(ADAPTIVE_STATE)
+
     # -------------------------------------------------------------------------
     # 8. Check for existing checkpoint
     # -------------------------------------------------------------------------
@@ -1525,6 +1831,19 @@ def main():
             history = checkpoint['history']
         for key in ('train_center_loss', 'val_center_loss'):
             history.setdefault(key, [])
+
+        adaptive_payload = checkpoint.get('adaptive_state')
+        if isinstance(adaptive_payload, dict):
+            ADAPTIVE_STATE.load_state_dict(adaptive_payload)
+            ADAPTIVE_STATE.apply_to_criterion(criterion)
+            adaptive_controller.best_val_mae = best_val_mae
+
+        tuner_payload = checkpoint.get('adaptive_tuner')
+        if isinstance(tuner_payload, dict):
+            adaptive_controller.best_val_mae = tuner_payload.get('best_val_mae', best_val_mae)
+            adaptive_controller.no_improve_epochs = int(
+                tuner_payload.get('no_improve_epochs', 0)
+            )
 
         def _safe_load_optimizer(opt, opt_state):
             if not opt_state:
@@ -1591,10 +1910,13 @@ def main():
     print("\n🚀 Starting training...")
     
     for epoch in range(start_epoch, Config.EPOCHS):
-        current_sigma = compute_sigma_for_epoch(epoch)
-        train_dataset.set_heatmap_sigma(current_sigma)
+        current_sigma = adaptive_controller.on_epoch_start(epoch, train_dataset, criterion)
+        val_dataset.set_heatmap_sigma(current_sigma)
         if (epoch % 5 == 0) or (epoch < 5):
-            print(f"Using heatmap sigma {current_sigma:.2f} for epoch {epoch+1}")
+            print(
+                f"Using heatmap sigma {current_sigma:.2f} and smoothing "
+                f"{ADAPTIVE_STATE.label_smoothing:.4f} for epoch {epoch+1}"
+            )
 
         # Check if we should unfreeze the backbone
         if epoch == Config.UNFREEZE_EPOCH:
@@ -1670,7 +1992,9 @@ def main():
             )
             print(f"  Val MAE: {val_mae:.2f} pixels")
             print(f"  Val RMSE: {val_rmse:.2f} pixels")
-            
+
+            adaptive_controller.on_validation_end(epoch, val_mae, val_stats, criterion)
+
             # Save sample predictions for visual inspection
             if (epoch + 1) % 5 == 0 or epoch < 25:  # Every 5 epochs or first 5 epochs
                 sample_path = save_sample_predictions(
@@ -1686,7 +2010,12 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'best_val_mae': best_val_mae,
                 'best_val_rmse': best_val_rmse,
-                'history': history
+                'history': history,
+                'adaptive_state': ADAPTIVE_STATE.state_dict(),
+                'adaptive_tuner': {
+                    'best_val_mae': adaptive_controller.best_val_mae,
+                    'no_improve_epochs': adaptive_controller.no_improve_epochs,
+                },
             }
             torch.save(checkpoint, checkpoint_path)
             
