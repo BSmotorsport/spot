@@ -676,14 +676,24 @@ class LossBalanceController:
         if not self.enabled:
             return
 
-        total = heatmap_loss + coord_loss + pixel_loss
+        heatmap_weight = float(getattr(criterion, 'heatmap_weight', self.state.heatmap_loss_weight))
+        coord_weight = float(getattr(criterion, 'coord_weight', self.state.coord_loss_weight))
+        pixel_weight = float(
+            getattr(criterion, 'pixel_coord_weight', self.state.pixel_coord_loss_weight)
+        )
+
+        weighted_losses = {
+            'heatmap': heatmap_weight * heatmap_loss,
+            'coord': coord_weight * coord_loss,
+            'pixel': pixel_weight * pixel_loss,
+        }
+
+        total = weighted_losses['heatmap'] + weighted_losses['coord'] + weighted_losses['pixel']
         if total <= 0:
             return
 
         contributions = {
-            'heatmap': heatmap_loss / total,
-            'coord': coord_loss / total,
-            'pixel': pixel_loss / total,
+            key: value / total for key, value in weighted_losses.items()
         }
 
         momentum = max(min(self.smoothing, 1.0), 0.0)
