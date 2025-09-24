@@ -4,6 +4,7 @@ import os
 import random
 import re
 import math
+import inspect
 from collections import defaultdict
 from typing import Optional
 
@@ -1875,22 +1876,42 @@ def main():
             interpolation=cv2.INTER_CUBIC,
         )
 
+    affine_params = inspect.signature(A.Affine.__init__).parameters
+    affine_kwargs = dict(
+        scale=(0.9, 1.1),
+        rotate=(-8, 8),
+        shear=(-4, 4),
+        fit_output=False,
+        p=0.4,
+    )
+    if "cval" in affine_params:
+        affine_kwargs["cval"] = 0
+    elif "value" in affine_params:
+        affine_kwargs["value"] = 0
+    if "mode" in affine_params:
+        affine_kwargs["mode"] = cv2.BORDER_REFLECT_101
+    elif "border_mode" in affine_params:
+        affine_kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+
+    perspective_params = inspect.signature(A.Perspective.__init__).parameters
+    perspective_kwargs = dict(
+        scale=(0.02, 0.05),
+        keep_size=True,
+        p=0.25,
+    )
+    if "pad_mode" in perspective_params:
+        perspective_kwargs["pad_mode"] = cv2.BORDER_REFLECT_101
+    elif "border_mode" in perspective_params:
+        perspective_kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+
     train_transform = A.Compose([
         A.OneOf([
             random_resized_crop,
             A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
         ], p=1.0),
         A.HorizontalFlip(p=0.5),
-        A.Affine(
-            scale=(0.9, 1.1),
-            rotate=(-8, 8),
-            shear=(-4, 4),
-            fit_output=False,
-            cval=0,
-            mode=cv2.BORDER_REFLECT_101,
-            p=0.4,
-        ),
-        A.Perspective(scale=(0.02, 0.05), keep_size=True, pad_mode=cv2.BORDER_REFLECT_101, p=0.25),
+        A.Affine(**affine_kwargs),
+        A.Perspective(**perspective_kwargs),
         A.RandomBrightnessContrast(0.25, 0.2, p=0.5),
         A.ColorJitter(0.12, 0.12, 0.12, 0.05, p=0.3),
         A.GaussNoise(p=0.3),
