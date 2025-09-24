@@ -138,6 +138,65 @@ def set_seeds(seed=42):
 
 set_seeds(Config.RANDOM_SEED)
 
+# ----------------------------------------------------------------------------------
+# Utility helpers
+# ----------------------------------------------------------------------------------
+
+
+def instantiate_albumentations_transform(transform_cls, common_kwargs, candidate_kwargs_list):
+    """Instantiate an Albumentations transform with backwards-compatible kwargs.
+
+    Some Albumentations releases rename or deprecate keyword arguments (e.g. ``mode``
+    -> ``border_mode``).  Passing an unknown kwarg raises a ``TypeError`` *and* emits
+    a warning, which is noisy when we probe for the right combination.  To avoid the
+    warnings, we first inspect the transform signature and only forward kwargs that
+    are explicitly supported.  We then try a series of candidate kwarg dictionaries
+    (typically containing alternative parameter names) until one succeeds.
+
+    Args:
+        transform_cls: The Albumentations transform class (e.g. ``A.Affine``).
+        common_kwargs: Dict of kwargs that should always be supplied.
+        candidate_kwargs_list: Iterable of dicts with alternative/legacy kwargs.
+
+    Returns:
+        Instantiated transform.
+
+    Raises:
+        TypeError: If none of the kwarg combinations are accepted.
+    """
+
+    signature = inspect.signature(transform_cls.__init__)
+    params = signature.parameters
+    accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    allowed_keys = None if accepts_var_kwargs else {name for name in params if name != "self"}
+
+    errors: list[str] = []
+    for candidate_kwargs in candidate_kwargs_list:
+        filtered_kwargs = candidate_kwargs
+        if allowed_keys is not None:
+            filtered_kwargs = {
+                key: value
+                for key, value in candidate_kwargs.items()
+                if key in allowed_keys
+            }
+
+        try:
+            return transform_cls(**common_kwargs, **filtered_kwargs)
+        except TypeError as exc:  # pragma: no cover - defensive; depends on albumentations version
+            errors.append(str(exc))
+            continue
+
+    try:
+        return transform_cls(**common_kwargs)
+    except TypeError as exc:  # pragma: no cover - defensive; depends on albumentations version
+        errors.append(str(exc))
+
+    attempted = [dict(kwargs) for kwargs in candidate_kwargs_list]
+    raise TypeError(
+        "Unable to instantiate transform %s; attempted kwargs: %s; errors: %s"
+        % (transform_cls.__name__, attempted, errors)
+    )
+
 # ======================================================================================
 # 1a. ADAPTIVE TRAINING STATE
 # ======================================================================================
@@ -1888,15 +1947,11 @@ def main():
         {"value": 0, "border_mode": cv2.BORDER_REFLECT_101},
         {},
     ]
-    affine_transform = None
-    for candidate in affine_candidates:
-        try:
-            affine_transform = A.Affine(**affine_common_kwargs, **candidate)
-            break
-        except TypeError:
-            continue
-    if affine_transform is None:
-        raise TypeError("Unable to instantiate Albumentations Affine transform with supported kwargs")
+    affine_transform = instantiate_albumentations_transform(
+        A.Affine,
+        affine_common_kwargs,
+        affine_candidates,
+    )
 
     perspective_common_kwargs = dict(
         scale=(0.02, 0.05),
@@ -1908,15 +1963,11 @@ def main():
         {"border_mode": cv2.BORDER_REFLECT_101},
         {},
     ]
-    perspective_transform = None
-    for candidate in perspective_candidates:
-        try:
-            perspective_transform = A.Perspective(**perspective_common_kwargs, **candidate)
-            break
-        except TypeError:
-            continue
-    if perspective_transform is None:
-        raise TypeError("Unable to instantiate Albumentations Perspective transform with supported kwargs")
+    perspective_transform = instantiate_albumentations_transform(
+        A.Perspective,
+        perspective_common_kwargs,
+        perspective_candidates,
+    )
 
     train_transform = A.Compose([
         A.OneOf([
