@@ -1672,7 +1672,9 @@ def main():
             ratio=(0.75, 1.33),
             interpolation=cv2.INTER_CUBIC,
         )
+
     except (TypeError, ValueError):
+
         random_resized_crop = A.RandomResizedCrop(
             height=Config.IMAGE_SIZE,
             width=Config.IMAGE_SIZE,
