@@ -74,10 +74,13 @@ class Config:
     # Loss weighting
     HEATMAP_LOSS_WEIGHT = 0.5
     HEATMAP_LOSS_WEIGHT_MIN = 0.35
+    HEATMAP_LOSS_WEIGHT_MAX = 1.0
     COORD_LOSS_WEIGHT = 0.3
     COORD_LOSS_WEIGHT_MAX = 0.45
+    COORD_LOSS_WEIGHT_MIN = 0.05
     PIXEL_COORD_LOSS_WEIGHT = 0.2
     PIXEL_COORD_LOSS_WEIGHT_MAX = 0.35
+    PIXEL_COORD_LOSS_WEIGHT_MIN = 0.05
     HEATMAP_CENTER_LOSS_WEIGHT = 0.05  # Encourage the heatmap peak to stay anchored on the target
     HEATMAP_CENTER_TEMPERATURE = 0.6   # Sharper soft-argmax for the center consistency loss
     HEATMAP_CENTER_TEMPERATURE_MIN = 0.35
@@ -102,10 +105,20 @@ class Config:
     ADAPTIVE_LOSS_WEIGHT_STEP = 0.03
     ADAPTIVE_CENTER_TEMP_DECAY = 0.85
     ADAPTIVE_LOGGING = True
+    ADAPTIVE_LR_DECAY = 0.6
+    ADAPTIVE_LR_COOLDOWN = 3
+    ADAPTIVE_MIN_LR = 5e-6
 
     # Validation settings
     VALIDATE_EVERY_N_EPOCHS = 1
     SAVE_BEST_ONLY = False
+
+    # Loss balancing controller
+    LOSS_BALANCER_ENABLED = True
+    LOSS_BALANCER_SMOOTHING = 0.25
+    LOSS_BALANCER_TOLERANCE = 0.08
+    LOSS_BALANCER_STEP = 0.02
+    LOSS_BALANCER_LOGGING = True
 
 # Create output directory
 os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
@@ -429,6 +442,7 @@ class AdaptiveTuningController:
         self.state = state
         self.best_val_mae: float = float("inf")
         self.no_improve_epochs: int = 0
+        self.last_lr_decay_epoch: int = -1000
 
     def on_epoch_start(
         self,
@@ -448,6 +462,8 @@ class AdaptiveTuningController:
         val_mae: float,
         val_stats: dict[str, float],
         criterion: "CombinedLoss",
+        optimizer: optim.Optimizer | None = None,
+        scheduler: "WarmupCosineLR" | None = None,
     ) -> None:
         if not Config.ADAPTIVE_TUNING_ENABLED:
             return
@@ -462,6 +478,7 @@ class AdaptiveTuningController:
             return
 
         adjustments: list[str] = []
+        header_printed = False
 
         # Push the target supervision sharper and reduce smoothing if plateaus persist.
         new_sigma = max(
@@ -585,6 +602,7 @@ class AdaptiveTuningController:
 
         if adjustments and Config.ADAPTIVE_LOGGING:
             print("\n🔁 Adaptive tuning triggered:")
+            header_printed = True
             for item in adjustments:
                 print(f"   • {item}")
 
@@ -592,6 +610,141 @@ class AdaptiveTuningController:
             self.state.apply_to_criterion(criterion)
             self.no_improve_epochs = 0
             self.best_val_mae = min(self.best_val_mae, float(val_mae))
+
+        # Optionally trigger a gentle learning-rate decay when the plateau persists.
+        if (
+            optimizer is not None
+            and Config.ADAPTIVE_LR_DECAY < 1.0
+            and (epoch - self.last_lr_decay_epoch) >= int(Config.ADAPTIVE_LR_COOLDOWN)
+        ):
+            decay_factor = float(Config.ADAPTIVE_LR_DECAY)
+            min_lr = float(Config.ADAPTIVE_MIN_LR)
+            lr_changed = False
+            new_lrs = []
+            for group in optimizer.param_groups:
+                current_lr = float(group.get('lr', 0.0))
+                if current_lr <= 0.0:
+                    new_lrs.append(current_lr)
+                    continue
+                decayed = max(min_lr, current_lr * decay_factor)
+                if decayed < current_lr - 1e-12:
+                    lr_changed = True
+                group['lr'] = decayed
+                new_lrs.append(decayed)
+            if lr_changed and scheduler is not None and hasattr(scheduler, "decay_base_lrs"):
+                scheduler.decay_base_lrs(decay_factor, min_lr=min_lr)
+            if lr_changed:
+                self.last_lr_decay_epoch = epoch
+                if Config.ADAPTIVE_LOGGING:
+                    if not header_printed:
+                        print("\n🔁 Adaptive tuning triggered:")
+                        header_printed = True
+                    pretty = ", ".join(f"{lr:.2e}" for lr in new_lrs)
+                    print(f"   • Learning rates decayed → {pretty}")
+
+
+class LossBalanceController:
+    """Balances loss contributions to keep optimisation gradients well-conditioned."""
+
+    def __init__(self, state: AdaptiveState) -> None:
+        self.state = state
+        self.enabled = bool(Config.LOSS_BALANCER_ENABLED)
+        base_total = (
+            Config.HEATMAP_LOSS_WEIGHT
+            + Config.COORD_LOSS_WEIGHT
+            + Config.PIXEL_COORD_LOSS_WEIGHT
+        )
+        if base_total <= 0:
+            base_total = 1.0
+        self.target_distribution = {
+            'heatmap': Config.HEATMAP_LOSS_WEIGHT / base_total,
+            'coord': Config.COORD_LOSS_WEIGHT / base_total,
+            'pixel': Config.PIXEL_COORD_LOSS_WEIGHT / base_total,
+        }
+        self.smoothing = float(Config.LOSS_BALANCER_SMOOTHING)
+        self.tolerance = float(Config.LOSS_BALANCER_TOLERANCE)
+        self.step = float(Config.LOSS_BALANCER_STEP)
+        self.ema_contributions = self.target_distribution.copy()
+
+    def observe(
+        self,
+        heatmap_loss: float,
+        coord_loss: float,
+        pixel_loss: float,
+        criterion: "CombinedLoss",
+    ) -> None:
+        if not self.enabled:
+            return
+
+        total = heatmap_loss + coord_loss + pixel_loss
+        if total <= 0:
+            return
+
+        contributions = {
+            'heatmap': heatmap_loss / total,
+            'coord': coord_loss / total,
+            'pixel': pixel_loss / total,
+        }
+
+        momentum = max(min(self.smoothing, 1.0), 0.0)
+        for key, value in contributions.items():
+            prev = self.ema_contributions.get(key, value)
+            self.ema_contributions[key] = prev * (1.0 - momentum) + value * momentum
+
+        adjustments: list[str] = []
+
+        def _adjust(current, target, weight, lower, upper, label):
+            if target < 0:
+                return weight
+            if current > target + self.tolerance:
+                new_weight = max(lower, weight - self.step)
+                if new_weight < weight - 1e-6:
+                    adjustments.append(f"{label} weight ↓ {new_weight:.2f}")
+                return new_weight
+            if current + self.tolerance < target:
+                new_weight = min(upper, weight + self.step)
+                if new_weight > weight + 1e-6:
+                    adjustments.append(f"{label} weight ↑ {new_weight:.2f}")
+                return new_weight
+            return weight
+
+        heatmap_weight = _adjust(
+            self.ema_contributions['heatmap'],
+            self.target_distribution['heatmap'],
+            self.state.heatmap_loss_weight,
+            Config.HEATMAP_LOSS_WEIGHT_MIN,
+            Config.HEATMAP_LOSS_WEIGHT_MAX,
+            "heatmap",
+        )
+
+        coord_weight = _adjust(
+            self.ema_contributions['coord'],
+            self.target_distribution['coord'],
+            self.state.coord_loss_weight,
+            Config.COORD_LOSS_WEIGHT_MIN,
+            Config.COORD_LOSS_WEIGHT_MAX,
+            "coord",
+        )
+
+        pixel_weight = _adjust(
+            self.ema_contributions['pixel'],
+            self.target_distribution['pixel'],
+            self.state.pixel_coord_loss_weight,
+            Config.PIXEL_COORD_LOSS_WEIGHT_MIN,
+            Config.PIXEL_COORD_LOSS_WEIGHT_MAX,
+            "pixel",
+        )
+
+        if adjustments and Config.LOSS_BALANCER_LOGGING:
+            print("\n⚖️ Loss balancer adjustments:")
+            for item in adjustments:
+                print(f"   • {item}")
+
+        if adjustments:
+            self.state.heatmap_loss_weight = heatmap_weight
+            self.state.coord_loss_weight = coord_weight
+            self.state.pixel_coord_loss_weight = pixel_weight
+            self.state.apply_to_criterion(criterion)
 
 # ======================================================================================
 # 3. DATASET CLASS
@@ -926,7 +1079,8 @@ class WarmupCosineLR:
         self.total_steps = max(int(total_steps), 1)
         self.warmup_steps = int(min(warmup_steps, self.total_steps))
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-        self.min_lrs = [lr * min_lr_ratio for lr in self.base_lrs]
+        self.min_lr_ratio = float(min_lr_ratio)
+        self.min_lrs = [lr * self.min_lr_ratio for lr in self.base_lrs]
         self.step_num = 0
         self.last_lrs = self.base_lrs.copy()
 
@@ -956,6 +1110,7 @@ class WarmupCosineLR:
             'warmup_steps': self.warmup_steps,
             'base_lrs': self.base_lrs,
             'min_lrs': self.min_lrs,
+            'min_lr_ratio': self.min_lr_ratio,
             'last_lrs': self.last_lrs,
         }
 
@@ -965,6 +1120,7 @@ class WarmupCosineLR:
         self.warmup_steps = state_dict['warmup_steps']
         self.base_lrs = state_dict['base_lrs']
         self.min_lrs = state_dict['min_lrs']
+        self.min_lr_ratio = state_dict.get('min_lr_ratio', self.min_lr_ratio)
         self.last_lrs = state_dict['last_lrs']
         self._apply_current_lrs()
 
@@ -972,6 +1128,31 @@ class WarmupCosineLR:
         # Reapply stored LR values to optimizer parameter groups
         for lr, group in zip(self.last_lrs, self.optimizer.param_groups):
             group['lr'] = lr
+
+    def decay_base_lrs(self, factor: float, min_lr: float = 0.0) -> list[float]:
+        """Decay stored base learning rates and re-synchronise the optimizer groups."""
+
+        factor = float(factor)
+        if factor >= 1.0:
+            return self.get_last_lr()
+
+        min_lr = float(min_lr)
+        new_last = []
+        for idx, (group, base_lr) in enumerate(
+            zip(self.optimizer.param_groups, self.base_lrs)
+        ):
+            new_base = max(min_lr, base_lr * factor)
+            self.base_lrs[idx] = new_base
+            self.min_lrs[idx] = max(min_lr, new_base * self.min_lr_ratio)
+
+            current_lr = float(group.get('lr', new_base))
+            capped_lr = min(current_lr, new_base)
+            capped_lr = max(capped_lr, self.min_lrs[idx])
+            group['lr'] = capped_lr
+            new_last.append(capped_lr)
+
+        self.last_lrs = new_last
+        return new_last
 
 
 def create_warmup_scheduler(optimizer, remaining_epochs, updates_per_epoch):
@@ -1786,7 +1967,7 @@ def main():
     ADAPTIVE_STATE.apply_to_criterion(criterion)
 
     scheduler = None
-    
+
     scaler = GradScaler(enabled=(Config.DEVICE == "cuda"))
     
     # -------------------------------------------------------------------------
@@ -1806,6 +1987,7 @@ def main():
     }
     
     adaptive_controller = AdaptiveTuningController(ADAPTIVE_STATE)
+    loss_balancer = LossBalanceController(ADAPTIVE_STATE)
 
     # -------------------------------------------------------------------------
     # 8. Check for existing checkpoint
@@ -1988,6 +2170,8 @@ def main():
             grad_accum_steps=Config.GRAD_ACCUM_STEPS,
         )
 
+        loss_balancer.observe(train_h_loss, train_c_loss, train_p_loss, criterion)
+
         # Validation phase
         if (epoch + 1) % Config.VALIDATE_EVERY_N_EPOCHS == 0:
             val_loss, val_mae, val_rmse, val_errors, val_stats = validate(
@@ -2020,7 +2204,14 @@ def main():
             print(f"  Val MAE: {val_mae:.2f} pixels")
             print(f"  Val RMSE: {val_rmse:.2f} pixels")
 
-            adaptive_controller.on_validation_end(epoch, val_mae, val_stats, criterion)
+            adaptive_controller.on_validation_end(
+                epoch,
+                val_mae,
+                val_stats,
+                criterion,
+                optimizer=optimizer,
+                scheduler=scheduler,
+            )
 
             # Save sample predictions for visual inspection
             if (epoch + 1) % 5 == 0 or epoch < 25:  # Every 5 epochs or first 5 epochs
