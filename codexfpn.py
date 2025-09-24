@@ -1876,33 +1876,47 @@ def main():
             interpolation=cv2.INTER_CUBIC,
         )
 
-    affine_params = inspect.signature(A.Affine.__init__).parameters
-    affine_kwargs = dict(
+    affine_common_kwargs = dict(
         scale=(0.9, 1.1),
         rotate=(-8, 8),
         shear=(-4, 4),
         fit_output=False,
         p=0.4,
     )
-    if "cval" in affine_params:
-        affine_kwargs["cval"] = 0
-    elif "value" in affine_params:
-        affine_kwargs["value"] = 0
-    if "mode" in affine_params:
-        affine_kwargs["mode"] = cv2.BORDER_REFLECT_101
-    elif "border_mode" in affine_params:
-        affine_kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+    affine_candidates = [
+        {"cval": 0, "mode": cv2.BORDER_REFLECT_101},
+        {"value": 0, "border_mode": cv2.BORDER_REFLECT_101},
+        {},
+    ]
+    affine_transform = None
+    for candidate in affine_candidates:
+        try:
+            affine_transform = A.Affine(**affine_common_kwargs, **candidate)
+            break
+        except TypeError:
+            continue
+    if affine_transform is None:
+        raise TypeError("Unable to instantiate Albumentations Affine transform with supported kwargs")
 
-    perspective_params = inspect.signature(A.Perspective.__init__).parameters
-    perspective_kwargs = dict(
+    perspective_common_kwargs = dict(
         scale=(0.02, 0.05),
         keep_size=True,
         p=0.25,
     )
-    if "pad_mode" in perspective_params:
-        perspective_kwargs["pad_mode"] = cv2.BORDER_REFLECT_101
-    elif "border_mode" in perspective_params:
-        perspective_kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+    perspective_candidates = [
+        {"pad_mode": cv2.BORDER_REFLECT_101},
+        {"border_mode": cv2.BORDER_REFLECT_101},
+        {},
+    ]
+    perspective_transform = None
+    for candidate in perspective_candidates:
+        try:
+            perspective_transform = A.Perspective(**perspective_common_kwargs, **candidate)
+            break
+        except TypeError:
+            continue
+    if perspective_transform is None:
+        raise TypeError("Unable to instantiate Albumentations Perspective transform with supported kwargs")
 
     train_transform = A.Compose([
         A.OneOf([
@@ -1910,8 +1924,8 @@ def main():
             A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
         ], p=1.0),
         A.HorizontalFlip(p=0.5),
-        A.Affine(**affine_kwargs),
-        A.Perspective(**perspective_kwargs),
+        affine_transform,
+        perspective_transform,
         A.RandomBrightnessContrast(0.25, 0.2, p=0.5),
         A.ColorJitter(0.12, 0.12, 0.12, 0.05, p=0.3),
         A.GaussNoise(p=0.3),
