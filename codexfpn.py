@@ -85,9 +85,9 @@ class Config:
     DROP_PATH_RATE: float = 0.1
     HEAD_DROPOUT: float = 0.25
 
-    MIXUP_ALPHA: float = 0.0
-    CUTMIX_ALPHA: float = 0.0
-    MIXUP_PROB: float = 0.0
+    MIXUP_ALPHA: float = 0.2
+    CUTMIX_ALPHA: float = 1.0
+    MIXUP_PROB: float = 0.5
     MIXUP_SWITCH_PROB: float = 0.5
 
     MIXUP_MODE: str = "batch"
@@ -353,9 +353,11 @@ class GeM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.clamp(min=self.eps)
-        x = x.pow(self.p.clamp(min=self.eps))
-        pooled = F.adaptive_avg_pool2d(x, 1)
-        return pooled.pow(1.0 / self.p.clamp(min=self.eps))
+        p = self.p.clamp(min=self.eps)
+        x = x.pow(p)
+        _, _, h, w = x.shape
+        pooled = F.avg_pool2d(x, kernel_size=(h, w))
+        return pooled.pow(1.0 / p)
 
 
 class CoordinateRegressionModel(nn.Module):
@@ -395,10 +397,10 @@ class CoordinateRegressionModel(nn.Module):
             nn.Linear(feature_dim * 3, hidden_dim),
             nn.GELU(),
             nn.Dropout(Config.HEAD_DROPOUT),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, 4),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone.forward_features(x)
         if features.dim() == 3:
             # Some transformer-style backbones return (B, N, C). Reshape back to
@@ -433,8 +435,11 @@ class CoordinateRegressionModel(nn.Module):
         maxv = self.max_pool(features)
         gem = self.gem_pool(features)
         pooled = torch.cat([avg, maxv, gem], dim=1).flatten(1)
-        logits = self.head(pooled)
-        return torch.sigmoid(logits)
+        output = self.head(pooled)
+        coords = torch.sigmoid(output[:, :2])
+        log_uncertainty = output[:, 2:]
+        uncertainty = torch.exp(log_uncertainty.clamp(max=10))
+        return coords, uncertainty
 
 
 def create_model(pretrained: bool = True) -> CoordinateRegressionModel:
@@ -449,24 +454,50 @@ def create_model(pretrained: bool = True) -> CoordinateRegressionModel:
 
 
 class CoordinateLoss(nn.Module):
-    """Smooth L1 + pixel MAE encourages precise coordinate regression."""
+    """Smooth L1 + pixel MAE encourages precise coordinate regression.
 
-    def __init__(self, pixel_weight: float = 1.0) -> None:
+    When the model predicts per-axis uncertainties, the loss down-weights the
+    contribution of samples with high variance while regularising the
+    uncertainty via a logarithmic penalty.  The class still accepts raw
+    coordinate tensors for backwards compatibility with lighter baselines and
+    unit tests.
+    """
+
+    def __init__(self, pixel_weight: float = 1.0, min_variance: float = 1e-4) -> None:
         super().__init__()
-        self.smooth_l1 = nn.SmoothL1Loss()
+        self.smooth_l1 = nn.SmoothL1Loss(reduction="none")
         self.pixel_weight = float(pixel_weight)
+        self.min_variance = float(min_variance)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor):
-        pred = pred.to(dtype=torch.float32)
+    def forward(self, pred: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], target: torch.Tensor):
+        coords: torch.Tensor
+        uncertainty: Optional[torch.Tensor]
+        if isinstance(pred, tuple):
+            coords, uncertainty = pred
+        else:
+            coords = pred
+            uncertainty = None
+
+        coords = coords.to(dtype=torch.float32)
         target = target.to(dtype=torch.float32)
-        smooth = self.smooth_l1(pred, target)
+
+        smooth = self.smooth_l1(coords, target)
+        smooth_mean = smooth.mean()
+
+        coord_term: torch.Tensor
+        if uncertainty is not None:
+            variance = uncertainty.to(dtype=torch.float32)
+            variance = variance.clamp(min=self.min_variance)
+            coord_term = (smooth / variance + torch.log(variance)).mean()
+        else:
+            coord_term = smooth_mean
 
         image_extent = max(float(Config.image_size() - 1), 1.0)
-        pixel_errors = torch.abs(pred - target) * image_extent
+        pixel_errors = torch.abs(coords - target) * image_extent
         pixel_mae = pixel_errors.mean()
 
-        loss = smooth + self.pixel_weight * (pixel_mae / image_extent)
-        return loss, smooth.detach(), pixel_mae.detach()
+        loss = coord_term + self.pixel_weight * (pixel_mae / image_extent)
+        return loss, smooth_mean.detach(), pixel_mae.detach()
 
 
 # ======================================================================================
@@ -700,8 +731,8 @@ def train_one_epoch(
             images = images.to(memory_format=torch.channels_last)
 
         with autocast(device_type="cuda" if Config.DEVICE.startswith("cuda") else "cpu", enabled=Config.AMP):
-            preds = model(images)
-            loss, coord_loss, pixel_mae = criterion(preds, targets)
+            coords, uncertainty = model(images)
+            loss, coord_loss, pixel_mae = criterion((coords, uncertainty), targets)
 
         scaled_loss = loss / Config.GRAD_ACCUM_STEPS
         scaler.scale(scaled_loss).backward()
@@ -757,15 +788,15 @@ def validate(
                 images = images.to(memory_format=torch.channels_last)
 
             with autocast(device_type="cuda" if Config.DEVICE.startswith("cuda") else "cpu", enabled=Config.AMP):
-                preds = model(images)
-                loss, coord_loss, pixel_mae = criterion(preds, targets)
+                coords, uncertainty = model(images)
+                loss, coord_loss, pixel_mae = criterion((coords, uncertainty), targets)
 
             total_loss += loss.item()
             total_coord += coord_loss.item()
             total_pixel += pixel_mae.item()
 
             image_extent = max(float(Config.image_size() - 1), 1.0)
-            batch_errors = torch.linalg.vector_norm((preds - targets) * image_extent, dim=-1)
+            batch_errors = torch.linalg.vector_norm((coords - targets) * image_extent, dim=-1)
             if batch_errors.ndim == 0:
                 batch_errors = batch_errors.unsqueeze(0)
             pixel_errors.extend(batch_errors.detach().cpu().tolist())
@@ -803,8 +834,10 @@ def save_sample_predictions(
         images = images.to(memory_format=torch.channels_last)
 
     with torch.no_grad():
-        preds = model(images).cpu()
+        preds, uncertainties = model(images)
 
+    preds = preds.cpu()
+    uncertainties = uncertainties.cpu()
     targets = targets.cpu()
     image_extent = float(Config.image_size() - 1)
     count = min(max_samples, images.size(0))
@@ -827,6 +860,8 @@ def save_sample_predictions(
 
         tgt = targets[idx] * image_extent
         prd = preds[idx] * image_extent
+        unc = uncertainties[idx]
+        sigma = torch.sqrt(unc.clamp(min=1e-6)) * image_extent
         pixel_error = float(math.dist(prd.tolist(), tgt.tolist()))
 
         ax.scatter([tgt[0]], [tgt[1]], c="lime", marker="o", label="target")
@@ -839,6 +874,7 @@ def save_sample_predictions(
         annotation = (
             f"Target: ({tgt[0]:.1f}, {tgt[1]:.1f})\n"
             f"Pred:   ({prd[0]:.1f}, {prd[1]:.1f})\n"
+            f"σ:      ({sigma[0]:.1f}, {sigma[1]:.1f}) px\n"
             f"Δpx:    {pixel_error:.2f}"
         )
         ax.text(
@@ -1126,7 +1162,12 @@ def main() -> None:
 
     model = create_model(pretrained=True).to(Config.DEVICE)
 
-    head_params = list(model.head.parameters()) + list(model.avg_pool.parameters()) + list(model.max_pool.parameters())
+    head_params = (
+        list(model.head.parameters())
+        + list(model.avg_pool.parameters())
+        + list(model.max_pool.parameters())
+        + list(model.gem_pool.parameters())
+    )
 
     if Config.FREEZE_BACKBONE_EPOCHS > 0:
         for param in model.backbone.parameters():
