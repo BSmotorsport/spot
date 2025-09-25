@@ -77,7 +77,7 @@ class Config:
     WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
-    GRAD_ACCUM_STEPS: int = 1
+    GRAD_ACCUM_STEPS: int = 8
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     AMP: bool = torch.cuda.is_available()
     USE_CHANNELS_LAST: bool = True
