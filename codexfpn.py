@@ -740,6 +740,7 @@ class LossBalanceController:
         heatmap_loss: float,
         coord_loss: float,
         pixel_loss: float,
+        pixel_penalty: float,
         criterion: "CombinedLoss",
     ) -> None:
         if not self.enabled:
@@ -754,7 +755,7 @@ class LossBalanceController:
         weighted_losses = {
             'heatmap': heatmap_weight * heatmap_loss,
             'coord': coord_weight * coord_loss,
-            'pixel': pixel_weight * pixel_loss,
+            'pixel': pixel_weight * pixel_penalty,
         }
 
         total = weighted_losses['heatmap'] + weighted_losses['coord'] + weighted_losses['pixel']
@@ -1079,6 +1080,7 @@ class CombinedLoss(nn.Module):
             total_loss = self.heatmap_weight * h_loss
             c_loss = pred_heatmaps_fp32.new_tensor(0.0)
             pixel_loss = pred_heatmaps_fp32.new_tensor(0.0)
+            pixel_penalty = pred_heatmaps_fp32.new_tensor(0.0)
             center_loss = pred_heatmaps_fp32.new_tensor(0.0)
 
             if (
@@ -1133,11 +1135,10 @@ class CombinedLoss(nn.Module):
                             torch.log1p(pixel_abs_error / log_scale).mean() * log_scale
                         )
 
+                    pixel_penalty = loss_term
                     total_loss = total_loss + self.pixel_coord_weight * loss_term
 
-        outputs = (total_loss, h_loss, c_loss, pixel_loss)
-        if target_coords_fp32 is not None or self.heatmap_center_weight > 0.0:
-            outputs = outputs + (center_loss,)
+        outputs = (total_loss, h_loss, c_loss, pixel_loss, pixel_penalty, center_loss)
 
         return outputs
 
@@ -1531,6 +1532,7 @@ def train_one_epoch(
     total_heatmap_loss = 0.0
     total_coord_loss = 0.0
     total_pixel_loss = 0.0
+    total_pixel_penalty = 0.0
     total_center_loss = 0.0
 
     num_batches = len(dataloader)
@@ -1572,19 +1574,34 @@ def train_one_epoch(
             pred_heatmaps, pred_coords = model(images)
 
             if target_b is not None and coords_b is not None:
-                loss_a, h_loss_a, c_loss_a, p_loss_a, ctr_loss_a = criterion(
+                (
+                    loss_a,
+                    h_loss_a,
+                    c_loss_a,
+                    p_loss_a,
+                    p_penalty_a,
+                    ctr_loss_a,
+                ) = criterion(
                     pred_heatmaps, target_a, pred_coords, coords_a
                 )
-                loss_b, h_loss_b, c_loss_b, p_loss_b, ctr_loss_b = criterion(
+                (
+                    loss_b,
+                    h_loss_b,
+                    c_loss_b,
+                    p_loss_b,
+                    p_penalty_b,
+                    ctr_loss_b,
+                ) = criterion(
                     pred_heatmaps, target_b, pred_coords, coords_b
                 )
                 loss = lam * loss_a + (1 - lam) * loss_b
                 h_loss = lam * h_loss_a + (1 - lam) * h_loss_b
                 c_loss = lam * c_loss_a + (1 - lam) * c_loss_b
                 p_loss = lam * p_loss_a + (1 - lam) * p_loss_b
+                p_penalty = lam * p_penalty_a + (1 - lam) * p_penalty_b
                 center_loss = lam * ctr_loss_a + (1 - lam) * ctr_loss_b
             else:
-                loss, h_loss, c_loss, p_loss, center_loss = criterion(
+                loss, h_loss, c_loss, p_loss, p_penalty, center_loss = criterion(
                     pred_heatmaps, target_a, pred_coords, coords_a
                 )
 
@@ -1599,6 +1616,7 @@ def train_one_epoch(
         total_heatmap_loss += h_loss.item()
         total_coord_loss += c_loss.item()
         total_pixel_loss += p_loss.item()
+        total_pixel_penalty += p_penalty.item()
         total_center_loss += center_loss.item()
 
         processed_batches += 1
@@ -1632,6 +1650,7 @@ def train_one_epoch(
                 'h_loss': f"{h_loss.item():.4f}",
                 'c_loss': f"{c_loss.item():.4f}",
                 'p_loss': f"{p_loss.item():.4f}",
+                'p_pen': f"{p_penalty.item():.4f}",
                 'ctr': f"{center_loss.item():.4f}",
             }
         )
@@ -1642,9 +1661,10 @@ def train_one_epoch(
     avg_h_loss = total_heatmap_loss / effective_batches
     avg_c_loss = total_coord_loss / effective_batches
     avg_p_loss = total_pixel_loss / effective_batches
+    avg_p_penalty = total_pixel_penalty / effective_batches
     avg_ctr_loss = total_center_loss / effective_batches
 
-    return avg_loss, avg_h_loss, avg_c_loss, avg_p_loss, avg_ctr_loss
+    return avg_loss, avg_h_loss, avg_c_loss, avg_p_loss, avg_p_penalty, avg_ctr_loss
 
 def validate(model, dataloader, criterion, device, epoch):
     """Validate the model and compute metrics."""
@@ -1655,6 +1675,7 @@ def validate(model, dataloader, criterion, device, epoch):
     all_errors = []
     fusion_weight_log = []
     total_pixel_loss = 0.0
+    total_pixel_penalty = 0.0
     total_center_loss = 0.0
 
     progress_bar = tqdm(dataloader, desc=f"Validation Epoch {epoch+1}", colour="yellow")
@@ -1674,7 +1695,7 @@ def validate(model, dataloader, criterion, device, epoch):
             # Forward pass
             with autocast(**_autocast_kwargs_for(device)):
                 pred_heatmaps, pred_coords = model(images)
-                loss, _, _, pixel_loss, center_loss = criterion(
+                loss, _, _, pixel_loss, pixel_penalty, center_loss = criterion(
                     pred_heatmaps,
                     target_heatmaps,
                     pred_coords,
@@ -1683,6 +1704,7 @@ def validate(model, dataloader, criterion, device, epoch):
 
             total_loss += loss.item()
             total_pixel_loss += pixel_loss.item()
+            total_pixel_penalty += pixel_penalty.item()
             total_center_loss += center_loss.item()
             
             # Extract coordinates from heatmap for evaluation
@@ -1726,9 +1748,11 @@ def validate(model, dataloader, criterion, device, epoch):
             })
     
     # Aggregate metrics
-    avg_loss = total_loss / len(dataloader)
-    avg_pixel_loss = total_pixel_loss / len(dataloader)
-    avg_center_loss = total_center_loss / len(dataloader)
+    num_batches = max(len(dataloader), 1)
+    avg_loss = total_loss / num_batches
+    avg_pixel_loss = total_pixel_loss / num_batches
+    avg_pixel_penalty = total_pixel_penalty / num_batches
+    avg_center_loss = total_center_loss / num_batches
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     
@@ -1761,6 +1785,7 @@ def validate(model, dataloader, criterion, device, epoch):
         all_errors,
         {
             'pixel_loss': avg_pixel_loss,
+            'pixel_penalty': avg_pixel_penalty,
             'center_loss': avg_center_loss,
             'heatmap_mae': mae_heatmap,
             'regressor_mae': mae_regressor,
@@ -2263,7 +2288,14 @@ def main():
         print(f"Learning rates: {lr_report}")
 
         # Training phase
-        train_loss, train_h_loss, train_c_loss, train_p_loss, train_ctr_loss = train_one_epoch(
+        (
+            train_loss,
+            train_h_loss,
+            train_c_loss,
+            train_p_loss,
+            train_p_penalty,
+            train_ctr_loss,
+        ) = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -2275,7 +2307,13 @@ def main():
             grad_accum_steps=Config.GRAD_ACCUM_STEPS,
         )
 
-        loss_balancer.observe(train_h_loss, train_c_loss, train_p_loss, criterion)
+        loss_balancer.observe(
+            train_h_loss,
+            train_c_loss,
+            train_p_loss,
+            train_p_penalty,
+            criterion,
+        )
 
         # Validation phase
         if (epoch + 1) % Config.VALIDATE_EVERY_N_EPOCHS == 0:
@@ -2297,11 +2335,12 @@ def main():
             print(
                 "  Train Loss: "
                 f"{train_loss:.4f} (H: {train_h_loss:.4f}, C: {train_c_loss:.4f}, "
-                f"Px: {train_p_loss:.4f}, Ctr: {train_ctr_loss:.4f})"
+                f"Px: {train_p_loss:.4f} [log {train_p_penalty:.4f}], "
+                f"Ctr: {train_ctr_loss:.4f})"
             )
             print(
                 "  Val Loss: "
-                f"{val_loss:.4f} (Px: {val_stats['pixel_loss']:.4f}, "
+                f"{val_loss:.4f} (Px: {val_stats['pixel_loss']:.4f} [log {val_stats['pixel_penalty']:.4f}], "
                 f"Ctr: {val_stats['center_loss']:.4f}, "
                 f"HM-MAE: {val_stats['heatmap_mae']:.2f}px, Reg-MAE: {val_stats['regressor_mae']:.2f}px, "
                 f"w_hm: {val_stats['fusion_weight']:.2f})"
