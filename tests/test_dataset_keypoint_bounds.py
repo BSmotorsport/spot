@@ -34,43 +34,29 @@ def test_rotated_sample_targets_stay_in_range(tmp_path):
     transform = A.Compose([
         A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
         A.Rotate(limit=(45, 45), border_mode=cv2.BORDER_CONSTANT, p=1.0),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        A.Normalize(mean=Config.NORMALIZE_MEAN, std=Config.NORMALIZE_STD),
         ToTensorV2(),
     ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=True))
 
     dataset = FootballDataset(
         [str(center_path), str(edge_path)],
         transform=transform,
-        heatmap_size=Config.HEATMAP_SIZE,
-        heatmap_sigma=Config.HEATMAP_SIGMA_START,
     )
 
-    image_tensor, target_heatmap, precise_coords = dataset[0]
+    image_tensor, precise_coords, path = dataset[0]
 
     assert image_tensor.shape == (3, Config.IMAGE_SIZE, Config.IMAGE_SIZE)
-    assert target_heatmap.shape == (1, Config.HEATMAP_SIZE, Config.HEATMAP_SIZE)
     assert precise_coords.shape == (2,)
+    assert path.endswith(".jpg")
 
     assert torch.all(precise_coords >= 0.0)
     assert torch.all(precise_coords < 1.0)
 
     image_coords = precise_coords * (Config.IMAGE_SIZE - 1)
-    heatmap_coords = precise_coords * (Config.HEATMAP_SIZE - 1)
-
     assert torch.all(image_coords >= 0.0)
     assert torch.all(image_coords <= Config.IMAGE_SIZE - 1)
-    assert torch.all(heatmap_coords >= 0.0)
-    assert torch.all(heatmap_coords <= Config.HEATMAP_SIZE - 1)
-
-    heatmap_np = target_heatmap.squeeze(0).numpy()
-    peak_index = np.argmax(heatmap_np)
-    peak_y, peak_x = np.unravel_index(peak_index, heatmap_np.shape)
-
-    assert abs(peak_x - heatmap_coords[0].item()) <= 2.0
-    assert abs(peak_y - heatmap_coords[1].item()) <= 2.0
 
     # The second sample should fall back to the first if its keypoint is dropped
-    image_tensor_2, target_heatmap_2, precise_coords_2 = dataset[1]
+    image_tensor_2, precise_coords_2, _ = dataset[1]
     assert torch.allclose(image_tensor, image_tensor_2)
-    assert torch.allclose(target_heatmap, target_heatmap_2)
     assert torch.allclose(precise_coords, precise_coords_2)
