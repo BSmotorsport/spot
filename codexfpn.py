@@ -356,16 +356,13 @@ class CoordinateLoss(nn.Module):
 # ======================================================================================
 
 
-def prepare_dataloaders(
+def build_train_loader(
     train_files: Sequence[str],
-    val_files: Sequence[str],
     train_transform: A.BasicTransform,
-    val_transform: A.BasicTransform,
-) -> Tuple[DataLoader, DataLoader]:
+) -> DataLoader:
     train_dataset = FootballDataset(train_files, transform=train_transform)
-    val_dataset = FootballDataset(val_files, transform=val_transform, augment=False)
 
-    train_loader = DataLoader(
+    return DataLoader(
         train_dataset,
         batch_size=Config.BATCH_SIZE,
         shuffle=True,
@@ -374,7 +371,14 @@ def prepare_dataloaders(
         drop_last=True,
     )
 
-    val_loader = DataLoader(
+
+def build_val_loader(
+    val_files: Sequence[str],
+    val_transform: A.BasicTransform,
+) -> DataLoader:
+    val_dataset = FootballDataset(val_files, transform=val_transform, augment=False)
+
+    return DataLoader(
         val_dataset,
         batch_size=Config.BATCH_SIZE,
         shuffle=False,
@@ -382,6 +386,15 @@ def prepare_dataloaders(
         pin_memory=True,
     )
 
+
+def prepare_dataloaders(
+    train_files: Sequence[str],
+    val_files: Sequence[str],
+    train_transform: A.BasicTransform,
+    val_transform: A.BasicTransform,
+) -> Tuple[DataLoader, DataLoader]:
+    train_loader = build_train_loader(train_files, train_transform)
+    val_loader = build_val_loader(val_files, val_transform)
     return train_loader, val_loader
 
 
@@ -694,6 +707,19 @@ def build_transforms() -> dict:
         ],
     )
 
+    gauss_noise = instantiate_albumentations_transform(
+        A.GaussNoise,
+        dict(p=0.2),
+        [
+            {"var_limit": (0.0, 10.0)},
+            {"sigma_limit": (0.0, math.sqrt(10.0))},
+        ],
+    )
+    if hasattr(gauss_noise, "var_limit"):
+        gauss_noise.var_limit = (0.0, 10.0)
+    elif hasattr(gauss_noise, "sigma_limit"):
+        gauss_noise.sigma_limit = (0.0, math.sqrt(10.0))
+
     train_transform = A.Compose(
         [
             A.OneOf([random_resized_crop, A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE)], p=1.0),
@@ -702,7 +728,7 @@ def build_transforms() -> dict:
             perspective,
             A.RandomBrightnessContrast(0.2, 0.15, p=0.45),
             A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.25),
-            A.GaussNoise(var_limit=(0.0, 10.0), p=0.2),
+            gauss_noise,
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
@@ -785,17 +811,6 @@ def main() -> None:
     if full_train_transform is None or val_transform is None:
         raise ValueError("build_transforms() must provide 'train' and 'val' transforms")
 
-    initial_train_transform = full_train_transform
-    if Config.AUG_WARMUP_EPOCHS > 0 and warmup_transform is not None:
-        initial_train_transform = warmup_transform
-
-    train_loader, val_loader = prepare_dataloaders(
-        train_files,
-        val_files,
-        initial_train_transform,
-        val_transform,
-    )
-
     model = create_model(pretrained=True).to(Config.DEVICE)
 
     head_params = list(model.head.parameters()) + list(model.avg_pool.parameters()) + list(model.max_pool.parameters())
@@ -847,22 +862,21 @@ def main() -> None:
     start_epoch, best_val_mae, history = load_checkpoint(model, optimizer, scheduler, scaler)
 
     use_warmup_aug = Config.AUG_WARMUP_EPOCHS > 0 and warmup_transform is not None
-    if use_warmup_aug and start_epoch >= Config.AUG_WARMUP_EPOCHS:
-        train_loader.dataset.transform = full_train_transform
-        augmentation_swapped = True
-    elif use_warmup_aug:
-        train_loader.dataset.transform = warmup_transform
+    if use_warmup_aug and start_epoch < Config.AUG_WARMUP_EPOCHS:
+        train_loader = build_train_loader(train_files, warmup_transform)
         augmentation_swapped = False
     else:
-        train_loader.dataset.transform = full_train_transform
+        train_loader = build_train_loader(train_files, full_train_transform)
         augmentation_swapped = True
+
+    val_loader = build_val_loader(val_files, val_transform)
 
     for epoch in range(start_epoch, Config.EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.EPOCHS}")
 
         if use_warmup_aug and not augmentation_swapped and epoch >= Config.AUG_WARMUP_EPOCHS:
             print("\nEnabling full augmentation pipeline")
-            train_loader.dataset.transform = full_train_transform
+            train_loader = build_train_loader(train_files, full_train_transform)
             augmentation_swapped = True
 
         if Config.FREEZE_BACKBONE_EPOCHS and epoch == Config.FREEZE_BACKBONE_EPOCHS:
