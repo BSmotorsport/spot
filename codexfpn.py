@@ -73,7 +73,8 @@ class Config:
     BATCH_SIZE: int = 2
     EPOCHS: int = 200
     INITIAL_LR: float = 1e-4
-    BACKBONE_LR: float = 1e-5
+    BACKBONE_LR: float = 2e-5
+
     WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
@@ -83,19 +84,20 @@ class Config:
     USE_CHANNELS_LAST: bool = True
 
     DROP_PATH_RATE: float = 0.1
-    HEAD_DROPOUT: float = 0.25
+    HEAD_DROPOUT: float = 0.15
 
     MIXUP_ALPHA: float = 0.2
-    CUTMIX_ALPHA: float = 1.0
-    MIXUP_PROB: float = 0.5
-    MIXUP_SWITCH_PROB: float = 0.5
+    CUTMIX_ALPHA: float = 0.0
+    MIXUP_PROB: float = 0.15
+    MIXUP_SWITCH_PROB: float = 0.0
 
     MIXUP_MODE: str = "batch"
+    MIXUP_START_EPOCH: int = 30
 
 
     LR_WARMUP_EPOCHS: int = 10
     LR_WARMUP_START_FACTOR: float = 0.2
-    AUG_WARMUP_EPOCHS: int = 10
+    AUG_WARMUP_EPOCHS: int = 20
 
     NORMALIZE_MEAN: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     NORMALIZE_STD: Tuple[float, float, float] = (0.229, 0.224, 0.225)
@@ -1049,13 +1051,14 @@ def build_transforms() -> dict:
 
     random_resized_crop = instantiate_albumentations_transform(
         A.RandomResizedCrop,
-        dict(scale=(0.5, 1.0), ratio=(0.75, 1.33), interpolation=cv2.INTER_CUBIC),
+        dict(scale=(0.7, 1.0), ratio=(0.9, 1.1), interpolation=cv2.INTER_CUBIC),
+
         random_resized_crop_candidates,
     )
 
     affine = instantiate_albumentations_transform(
         A.Affine,
-        dict(scale=(0.92, 1.08), rotate=(-6, 6), shear=(-3, 3), fit_output=False, p=0.3),
+        dict(scale=(0.95, 1.05), rotate=(-4, 4), shear=(-2, 2), fit_output=False, p=0.2),
         [
             {"cval": 0, "mode": cv2.BORDER_REFLECT_101},
             {"value": 0, "border_mode": cv2.BORDER_REFLECT_101},
@@ -1065,7 +1068,7 @@ def build_transforms() -> dict:
 
     perspective = instantiate_albumentations_transform(
         A.Perspective,
-        dict(scale=(0.015, 0.04), keep_size=True, p=0.15),
+        dict(scale=(0.01, 0.03), keep_size=True, p=0.1),
         [
             {"pad_mode": cv2.BORDER_REFLECT_101},
             {"border_mode": cv2.BORDER_REFLECT_101},
@@ -1075,32 +1078,34 @@ def build_transforms() -> dict:
 
     gauss_noise = instantiate_albumentations_transform(
         A.GaussNoise,
-        dict(p=0.2),
+        dict(p=0.15),
         [
             {"var_limit": (0.0, 10.0)},
             {"sigma_limit": (0.0, math.sqrt(10.0))},
         ],
     )
     if hasattr(gauss_noise, "var_limit"):
-        gauss_noise.var_limit = (0.0, 10.0)
+        gauss_noise.var_limit = (0.0, 6.0)
     elif hasattr(gauss_noise, "sigma_limit"):
-        gauss_noise.sigma_limit = (0.0, math.sqrt(10.0))
+        gauss_noise.sigma_limit = (0.0, math.sqrt(6.0))
 
     train_transform = A.Compose(
         [
-            A.OneOf([random_resized_crop, A.Resize(image_size, image_size)], p=1.0),
+            A.OneOf([random_resized_crop, A.Resize(image_size, image_size)], p=0.75),
+            A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
             affine,
             perspective,
-            A.RandomBrightnessContrast(0.2, 0.15, p=0.45),
-            A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.25),
-            A.HueSaturationValue(20, 30, 20, p=0.5),
+            A.RandomBrightnessContrast(0.1, 0.1, p=0.35),
+            A.ColorJitter(0.08, 0.08, 0.08, 0.04, p=0.2),
+            A.HueSaturationValue(12, 18, 12, p=0.35),
             A.OneOf(
                 [
-                    A.MotionBlur(blur_limit=7),
-                    A.GaussianBlur(blur_limit=(3, 7)),
+                    A.MotionBlur(blur_limit=5),
+                    A.GaussianBlur(blur_limit=(3, 5)),
+
                 ],
-                p=0.3,
+                p=0.2,
             ),
             gauss_noise,
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -1117,7 +1122,7 @@ def build_transforms() -> dict:
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
-        keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+        keypoint_params=A.KeypointParams(format="xy", remove_invisible=True),
     )
 
     val_transform = A.Compose(
@@ -1269,15 +1274,7 @@ def main() -> None:
 
     val_loader = build_val_loader(val_files, val_transform)
     mixup_cutmix_fn = create_mixup_cutmix_fn()
-
-    mixup_fn: Optional[MixupCutmix] = None
-    if Config.MIXUP_PROB > 0.0 and (Config.MIXUP_ALPHA > 0.0 or Config.CUTMIX_ALPHA > 0.0):
-        mixup_fn = MixupCutmix(
-            mixup_alpha=Config.MIXUP_ALPHA,
-            cutmix_alpha=Config.CUTMIX_ALPHA,
-            prob=Config.MIXUP_PROB,
-            switch_prob=Config.MIXUP_SWITCH_PROB,
-        )
+    mixup_active = False
 
     for epoch in range(start_epoch, Config.EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.EPOCHS}")
@@ -1286,6 +1283,14 @@ def main() -> None:
             print("\nEnabling full augmentation pipeline")
             train_loader = build_train_loader(train_files, full_train_transform)
             augmentation_swapped = True
+
+        if (
+            mixup_cutmix_fn is not None
+            and not mixup_active
+            and (epoch + 1) >= Config.MIXUP_START_EPOCH
+        ):
+            print("\nEnabling mixup augmentation")
+            mixup_active = True
 
         if Config.FREEZE_BACKBONE_EPOCHS and epoch == Config.FREEZE_BACKBONE_EPOCHS:
             print("\nUnfreezing backbone for fine-tuning")
@@ -1299,7 +1304,7 @@ def main() -> None:
             criterion,
             scaler,
             epoch,
-            mixup_fn=mixup_cutmix_fn,
+            mixup_fn=mixup_cutmix_fn if mixup_active else None,
 
         )
         scheduler.step()
