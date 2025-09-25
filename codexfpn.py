@@ -72,8 +72,8 @@ class Config:
     MODEL_NAME: str = "convnext_base.fb_in22k_ft_in1k"
     BATCH_SIZE: int = 2
     EPOCHS: int = 200
-    INITIAL_LR: float = 5e-5
-    BACKBONE_LR: float = 5e-6
+    INITIAL_LR: float = 1e-4
+    BACKBONE_LR: float = 2e-5
     WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
@@ -83,19 +83,20 @@ class Config:
     USE_CHANNELS_LAST: bool = True
 
     DROP_PATH_RATE: float = 0.1
-    HEAD_DROPOUT: float = 0.25
+    HEAD_DROPOUT: float = 0.15
 
     MIXUP_ALPHA: float = 0.2
-    CUTMIX_ALPHA: float = 1.0
-    MIXUP_PROB: float = 0.5
-    MIXUP_SWITCH_PROB: float = 0.5
+    CUTMIX_ALPHA: float = 0.0
+    MIXUP_PROB: float = 0.15
+    MIXUP_SWITCH_PROB: float = 0.0
 
     MIXUP_MODE: str = "batch"
+    MIXUP_START_EPOCH: int = 30
 
 
     LR_WARMUP_EPOCHS: int = 10
     LR_WARMUP_START_FACTOR: float = 0.2
-    AUG_WARMUP_EPOCHS: int = 10
+    AUG_WARMUP_EPOCHS: int = 20
 
     NORMALIZE_MEAN: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     NORMALIZE_STD: Tuple[float, float, float] = (0.229, 0.224, 0.225)
@@ -105,6 +106,10 @@ class Config:
 
     # Loss
     PIXEL_LOSS_WEIGHT: float = 0.4
+    LOSS_MIN_VARIANCE: float = 0.01
+    LOSS_MAX_VARIANCE: float = 10.0
+    LOSS_VARIANCE_REG_WEIGHT: float = 0.01
+    USE_UNCERTAINTY: bool = False
 
     # Validation utilities
     VALIDATE_EVERY: int = 1
@@ -437,8 +442,13 @@ class CoordinateRegressionModel(nn.Module):
         pooled = torch.cat([avg, maxv, gem], dim=1).flatten(1)
         output = self.head(pooled)
         coords = torch.sigmoid(output[:, :2])
-        log_uncertainty = output[:, 2:]
-        uncertainty = torch.exp(log_uncertainty.clamp(max=10))
+        if Config.USE_UNCERTAINTY:
+            log_uncertainty = output[:, 2:]
+            max_log = float(math.log(Config.LOSS_MAX_VARIANCE)) if Config.LOSS_MAX_VARIANCE > 0 else 10.0
+            min_log = float(math.log(Config.LOSS_MIN_VARIANCE)) if Config.LOSS_MIN_VARIANCE > 0 else -10.0
+            uncertainty = torch.exp(log_uncertainty.clamp(min=min_log, max=max_log))
+        else:
+            uncertainty = torch.ones_like(coords)
         return coords, uncertainty
 
 
@@ -463,11 +473,19 @@ class CoordinateLoss(nn.Module):
     unit tests.
     """
 
-    def __init__(self, pixel_weight: float = 1.0, min_variance: float = 1e-4) -> None:
+    def __init__(
+        self,
+        pixel_weight: float = 1.0,
+        min_variance: float = 1e-4,
+        max_variance: float = 10.0,
+        variance_reg_weight: float = 0.01,
+    ) -> None:
         super().__init__()
         self.smooth_l1 = nn.SmoothL1Loss(reduction="none")
         self.pixel_weight = float(pixel_weight)
         self.min_variance = float(min_variance)
+        self.max_variance = float(max_variance)
+        self.variance_reg_weight = float(max(variance_reg_weight, 0.0))
 
     def forward(self, pred: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], target: torch.Tensor):
         coords: torch.Tensor
@@ -487,8 +505,13 @@ class CoordinateLoss(nn.Module):
         coord_term: torch.Tensor
         if uncertainty is not None:
             variance = uncertainty.to(dtype=torch.float32)
-            variance = variance.clamp(min=self.min_variance)
-            coord_term = (smooth / variance + torch.log(variance)).mean()
+            variance = variance.clamp(min=self.min_variance, max=self.max_variance)
+            scaled = (smooth / variance).mean() + torch.log(variance).mean()
+            if self.variance_reg_weight > 0.0:
+                variance_reg = self.variance_reg_weight * (variance.reciprocal()).mean()
+                coord_term = scaled + variance_reg
+            else:
+                coord_term = scaled
         else:
             coord_term = smooth_mean
 
@@ -780,6 +803,8 @@ def validate(
 
     progress = tqdm(loader, desc=f"Val {epoch+1}", colour="yellow")
 
+    all_preds: list[torch.Tensor] = []
+
     with torch.no_grad():
         for images, targets, _ in progress:
             images = images.to(Config.DEVICE, non_blocking=True)
@@ -794,6 +819,8 @@ def validate(
             total_loss += loss.item()
             total_coord += coord_loss.item()
             total_pixel += pixel_mae.item()
+
+            all_preds.append(coords.detach().cpu())
 
             image_extent = max(float(Config.image_size() - 1), 1.0)
             batch_errors = torch.linalg.vector_norm((coords - targets) * image_extent, dim=-1)
@@ -815,6 +842,18 @@ def validate(
     avg_coord = total_coord / batches
     avg_pixel = total_pixel / batches
     percentile_metrics = compute_percentile_errors(pixel_errors)
+
+    if all_preds:
+        stacked = torch.cat(all_preds, dim=0)
+        pred_mean = stacked.mean(dim=0)
+        pred_std = stacked.std(dim=0)
+        print(
+            "Prediction stats - Mean: "
+            f"{pred_mean.tolist()} Std: {pred_std.tolist()}"
+        )
+        if float(pred_std.mean()) < 0.05:
+            print("⚠️ Warning: Predictions may have collapsed to a single point")
+
     return avg_loss, avg_coord, avg_pixel, percentile_metrics
 
 
@@ -1011,13 +1050,13 @@ def build_transforms() -> dict:
 
     random_resized_crop = instantiate_albumentations_transform(
         A.RandomResizedCrop,
-        dict(scale=(0.3, 1.0), ratio=(0.5, 2.0), interpolation=cv2.INTER_CUBIC),
+        dict(scale=(0.7, 1.0), ratio=(0.9, 1.1), interpolation=cv2.INTER_CUBIC),
         random_resized_crop_candidates,
     )
 
     affine = instantiate_albumentations_transform(
         A.Affine,
-        dict(scale=(0.92, 1.08), rotate=(-6, 6), shear=(-3, 3), fit_output=False, p=0.3),
+        dict(scale=(0.95, 1.05), rotate=(-4, 4), shear=(-2, 2), fit_output=False, p=0.2),
         [
             {"cval": 0, "mode": cv2.BORDER_REFLECT_101},
             {"value": 0, "border_mode": cv2.BORDER_REFLECT_101},
@@ -1027,7 +1066,7 @@ def build_transforms() -> dict:
 
     perspective = instantiate_albumentations_transform(
         A.Perspective,
-        dict(scale=(0.015, 0.04), keep_size=True, p=0.15),
+        dict(scale=(0.01, 0.03), keep_size=True, p=0.1),
         [
             {"pad_mode": cv2.BORDER_REFLECT_101},
             {"border_mode": cv2.BORDER_REFLECT_101},
@@ -1037,32 +1076,33 @@ def build_transforms() -> dict:
 
     gauss_noise = instantiate_albumentations_transform(
         A.GaussNoise,
-        dict(p=0.2),
+        dict(p=0.15),
         [
             {"var_limit": (0.0, 10.0)},
             {"sigma_limit": (0.0, math.sqrt(10.0))},
         ],
     )
     if hasattr(gauss_noise, "var_limit"):
-        gauss_noise.var_limit = (0.0, 10.0)
+        gauss_noise.var_limit = (0.0, 6.0)
     elif hasattr(gauss_noise, "sigma_limit"):
-        gauss_noise.sigma_limit = (0.0, math.sqrt(10.0))
+        gauss_noise.sigma_limit = (0.0, math.sqrt(6.0))
 
     train_transform = A.Compose(
         [
-            A.OneOf([random_resized_crop, A.Resize(image_size, image_size)], p=1.0),
+            A.OneOf([random_resized_crop, A.Resize(image_size, image_size)], p=0.75),
+            A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
             affine,
             perspective,
-            A.RandomBrightnessContrast(0.2, 0.15, p=0.45),
-            A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.25),
-            A.HueSaturationValue(20, 30, 20, p=0.5),
+            A.RandomBrightnessContrast(0.1, 0.1, p=0.35),
+            A.ColorJitter(0.08, 0.08, 0.08, 0.04, p=0.2),
+            A.HueSaturationValue(12, 18, 12, p=0.35),
             A.OneOf(
                 [
-                    A.MotionBlur(blur_limit=15),
-                    A.GaussianBlur(blur_limit=(3, 7)),
+                    A.MotionBlur(blur_limit=5),
+                    A.GaussianBlur(blur_limit=(3, 5)),
                 ],
-                p=0.3,
+                p=0.2,
             ),
             gauss_noise,
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -1079,7 +1119,7 @@ def build_transforms() -> dict:
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
-        keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+        keypoint_params=A.KeypointParams(format="xy", remove_invisible=True),
     )
 
     val_transform = A.Compose(
@@ -1211,7 +1251,12 @@ def main() -> None:
             milestones=milestones,
         )
 
-    criterion = CoordinateLoss(pixel_weight=Config.PIXEL_LOSS_WEIGHT)
+    criterion = CoordinateLoss(
+        pixel_weight=Config.PIXEL_LOSS_WEIGHT,
+        min_variance=Config.LOSS_MIN_VARIANCE,
+        max_variance=Config.LOSS_MAX_VARIANCE,
+        variance_reg_weight=Config.LOSS_VARIANCE_REG_WEIGHT,
+    )
     scaler = GradScaler(enabled=Config.AMP)
 
     start_epoch, best_val_mae, history = load_checkpoint(model, optimizer, scheduler, scaler)
@@ -1226,15 +1271,7 @@ def main() -> None:
 
     val_loader = build_val_loader(val_files, val_transform)
     mixup_cutmix_fn = create_mixup_cutmix_fn()
-
-    mixup_fn: Optional[MixupCutmix] = None
-    if Config.MIXUP_PROB > 0.0 and (Config.MIXUP_ALPHA > 0.0 or Config.CUTMIX_ALPHA > 0.0):
-        mixup_fn = MixupCutmix(
-            mixup_alpha=Config.MIXUP_ALPHA,
-            cutmix_alpha=Config.CUTMIX_ALPHA,
-            prob=Config.MIXUP_PROB,
-            switch_prob=Config.MIXUP_SWITCH_PROB,
-        )
+    mixup_active = False
 
     for epoch in range(start_epoch, Config.EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.EPOCHS}")
@@ -1243,6 +1280,14 @@ def main() -> None:
             print("\nEnabling full augmentation pipeline")
             train_loader = build_train_loader(train_files, full_train_transform)
             augmentation_swapped = True
+
+        if (
+            mixup_cutmix_fn is not None
+            and not mixup_active
+            and (epoch + 1) >= Config.MIXUP_START_EPOCH
+        ):
+            print("\nEnabling mixup augmentation")
+            mixup_active = True
 
         if Config.FREEZE_BACKBONE_EPOCHS and epoch == Config.FREEZE_BACKBONE_EPOCHS:
             print("\nUnfreezing backbone for fine-tuning")
@@ -1256,7 +1301,7 @@ def main() -> None:
             criterion,
             scaler,
             epoch,
-            mixup_fn=mixup_cutmix_fn,
+            mixup_fn=mixup_cutmix_fn if mixup_active else None,
 
         )
         scheduler.step()
