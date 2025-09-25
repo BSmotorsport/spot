@@ -490,6 +490,7 @@ def save_sample_predictions(
     epoch: int,
     save_dir: str,
     max_samples: int = 6,
+    metrics: Optional[dict] = None,
 ) -> str:
     model.eval()
     iterator = iter(loader)
@@ -523,13 +524,58 @@ def save_sample_predictions(
 
         tgt = targets[idx] * image_extent
         prd = preds[idx] * image_extent
+        pixel_error = float(math.dist(prd.tolist(), tgt.tolist()))
+
         ax.scatter([tgt[0]], [tgt[1]], c="lime", marker="o", label="target")
         ax.scatter([prd[0]], [prd[1]], c="red", marker="x", label="pred")
-        ax.set_title(os.path.basename(paths[idx]))
+        filename = os.path.basename(paths[idx])
+        ax.set_title(f"{filename} | Δpx: {pixel_error:.2f}")
         ax.axis("off")
         ax.legend(loc="upper right")
 
-    plt.tight_layout()
+        annotation = (
+            f"Target: ({tgt[0]:.1f}, {tgt[1]:.1f})\n"
+            f"Pred:   ({prd[0]:.1f}, {prd[1]:.1f})\n"
+            f"Δpx:    {pixel_error:.2f}"
+        )
+        ax.text(
+            0.02,
+            0.95,
+            annotation,
+            transform=ax.transAxes,
+            fontsize=10,
+            color="white",
+            verticalalignment="top",
+            bbox={"boxstyle": "round", "facecolor": "black", "alpha": 0.6},
+        )
+
+    summary_lines: list[str] = []
+    if metrics:
+        epoch_num = metrics.get("epoch")
+        total_epochs = metrics.get("epochs")
+        if epoch_num is not None and total_epochs is not None:
+            summary_lines.append(f"Epoch {epoch_num}/{total_epochs}")
+        if "train_loss" in metrics and "train_pixel" in metrics:
+            summary_lines.append(
+                f"Train Loss: {metrics['train_loss']:.4f} | Train MAE: {metrics['train_pixel']:.2f} px"
+            )
+        if "train_coord" in metrics:
+            summary_lines.append(f"Train Coord MAE: {metrics['train_coord']:.4f}")
+        if "val_loss" in metrics and "val_pixel" in metrics:
+            summary_lines.append(
+                f"Val Loss: {metrics['val_loss']:.4f} | Val MAE: {metrics['val_pixel']:.2f} px"
+            )
+        if "val_coord" in metrics:
+            summary_lines.append(f"Val Coord MAE: {metrics['val_coord']:.4f}")
+        if "best_val_mae" in metrics:
+            summary_lines.append(f"Best Val MAE: {metrics['best_val_mae']:.2f} px")
+
+    if summary_lines:
+        fig.suptitle("\n".join(summary_lines), fontsize=12)
+        fig.tight_layout(rect=(0, 0, 1, 0.92))
+    else:
+        fig.tight_layout()
+
     output_path = os.path.join(save_dir, f"val_samples_epoch_{epoch+1}.png")
     fig.savefig(output_path, dpi=120)
     plt.close(fig)
@@ -749,26 +795,75 @@ def main() -> None:
         train_loss, train_coord, train_pixel = train_one_epoch(model, train_loader, optimizer, criterion, scaler, epoch)
         scheduler.step()
 
+        val_results: Optional[dict] = None
+
         if (epoch + 1) % Config.VALIDATE_EVERY == 0:
             val_loss, val_coord, val_pixel = validate(model, val_loader, criterion, epoch)
             history.setdefault("train", []).append(train_loss)
             history.setdefault("val", []).append(val_loss)
             history.setdefault("val_mae", []).append(val_pixel)
 
+            val_results = {
+                "loss": val_loss,
+                "coord": val_coord,
+                "pixel": val_pixel,
+            }
+
             if val_pixel < best_val_mae:
+                prev_best = best_val_mae
                 best_val_mae = val_pixel
                 save_checkpoint(epoch, model, optimizer, scheduler, scaler, best_val_mae, history)
-                print(f"Best model updated: val MAE {val_pixel:.2f} px")
+                if math.isinf(prev_best):
+                    print(f"Best model updated: val MAE {val_pixel:.2f} px (first checkpoint)")
+                else:
+                    print(
+                        "Best model updated: val MAE "
+                        f"{val_pixel:.2f} px (improved {prev_best - best_val_mae:.2f} px)"
+                    )
 
-            sample_path = save_sample_predictions(model, val_loader, epoch, Config.OUTPUT_DIR, Config.NUM_VAL_SAMPLES)
+            metrics_payload = {
+                "epoch": epoch + 1,
+                "epochs": Config.EPOCHS,
+                "train_loss": train_loss,
+                "train_coord": train_coord,
+                "train_pixel": train_pixel,
+                "val_loss": val_loss,
+                "val_coord": val_coord,
+                "val_pixel": val_pixel,
+                "best_val_mae": best_val_mae,
+            }
+
+            sample_path = save_sample_predictions(
+                model,
+                val_loader,
+                epoch,
+                Config.OUTPUT_DIR,
+                Config.NUM_VAL_SAMPLES,
+                metrics=metrics_payload,
+            )
             print(f"Validation samples saved to {sample_path}")
 
         else:
             history.setdefault("train", []).append(train_loss)
 
+        lr_values = [group["lr"] for group in optimizer.param_groups]
+        lr_text = ", ".join(f"{lr:.2e}" for lr in lr_values)
         print(
-            f"Train Loss: {train_loss:.4f} | Coord: {train_coord:.4f} | Pixel: {train_pixel:.2f} px"
+            "Train -> Loss: "
+            f"{train_loss:.4f} | Coord MAE: {train_coord:.4f} | Pixel MAE: {train_pixel:.2f} px"
+            f" | LRs: {lr_text}"
         )
+
+        if val_results is not None:
+            delta_pixel = val_results["pixel"] - train_pixel
+            print(
+                "Val   -> Loss: "
+                f"{val_results['loss']:.4f} | Coord MAE: {val_results['coord']:.4f} | "
+                f"Pixel MAE: {val_results['pixel']:.2f} px (Δ vs train: {delta_pixel:+.2f} px) | "
+                f"Best MAE: {best_val_mae:.2f} px"
+            )
+        else:
+            print("Val   -> Skipped (waiting for scheduled evaluation)")
 
     final_path = save_checkpoint(Config.EPOCHS - 1, model, optimizer, scheduler, scaler, best_val_mae, history)
     print(f"Training completed. Final checkpoint saved to {final_path}")
