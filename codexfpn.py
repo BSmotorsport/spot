@@ -829,7 +829,7 @@ def build_transforms() -> dict:
 
     random_resized_crop = instantiate_albumentations_transform(
         A.RandomResizedCrop,
-        dict(scale=(0.7, 1.0), ratio=(0.85, 1.2), interpolation=cv2.INTER_CUBIC),
+        dict(scale=(0.3, 1.0), ratio=(0.5, 2.0), interpolation=cv2.INTER_CUBIC),
         random_resized_crop_candidates,
     )
 
@@ -874,6 +874,14 @@ def build_transforms() -> dict:
             perspective,
             A.RandomBrightnessContrast(0.2, 0.15, p=0.45),
             A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.25),
+            A.HueSaturationValue(20, 30, 20, p=0.5),
+            A.OneOf(
+                [
+                    A.MotionBlur(blur_limit=15),
+                    A.GaussianBlur(blur_limit=(3, 7)),
+                ],
+                p=0.3,
+            ),
             gauss_noise,
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
