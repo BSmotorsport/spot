@@ -15,6 +15,7 @@ import numpy as np
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.amp import GradScaler, autocast
@@ -331,6 +332,21 @@ class FootballDataset(Dataset):
 # ======================================================================================
 
 
+class GeM(nn.Module):
+    """Generalised mean pooling with learnable exponent."""
+
+    def __init__(self, p: float = 3.0, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.clamp(min=self.eps)
+        x = x.pow(self.p.clamp(min=self.eps))
+        pooled = F.adaptive_avg_pool2d(x, 1)
+        return pooled.pow(1.0 / self.p.clamp(min=self.eps))
+
+
 class CoordinateRegressionModel(nn.Module):
     """Backbone + attention-pooled head that regresses normalised coordinates."""
 
@@ -350,11 +366,20 @@ class CoordinateRegressionModel(nn.Module):
         if feature_dim is None:
             raise AttributeError("Backbone does not expose num_features")
 
+        reduction_channels = max(feature_dim // 8, 1)
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(feature_dim, reduction_channels, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduction_channels, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.gem_pool = GeM()
         self.head = nn.Sequential(
-            nn.LayerNorm(feature_dim * 2),
-            nn.Linear(feature_dim * 2, hidden_dim),
+            nn.LayerNorm(feature_dim * 3),
+            nn.Linear(feature_dim * 3, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, 2),
@@ -388,9 +413,13 @@ class CoordinateRegressionModel(nn.Module):
                     )
             features = spatial_tokens.transpose(1, 2).reshape(b, c, side, side)
 
+        attn = self.spatial_attention(features)
+        features = features * attn
+
         avg = self.avg_pool(features)
         maxv = self.max_pool(features)
-        pooled = torch.cat([avg, maxv], dim=1).flatten(1)
+        gem = self.gem_pool(features)
+        pooled = torch.cat([avg, maxv, gem], dim=1).flatten(1)
         logits = self.head(pooled)
         return torch.sigmoid(logits)
 
