@@ -28,7 +28,15 @@ from tqdm import tqdm
 
 
 class Config:
-    """Centralised hyperparameters for the coordinate regression pipeline."""
+    """Centralised hyperparameters for the coordinate regression pipeline.
+
+    ``MODEL_NAME`` must be one of :pyattr:`BACKBONE_CHOICES`.  The curated set
+    mixes the original ConvNeXt baseline with global-context transformer models
+    (ViT/Swin) and lighter CNN alternatives (EfficientNet) so experiments can
+    quickly compare architectural families.  The helper :py:meth:`image_size`
+    adapts preprocessing to the recommended resolution for the selected
+    backbone.
+    """
 
     # Paths
     DATASET_PATH: str = r"E:\\BOTB\\dataset\\aug"
@@ -38,7 +46,26 @@ class Config:
     # Image geometry
     ORIGINAL_WIDTH: int = 4416
     ORIGINAL_HEIGHT: int = 3336
-    IMAGE_SIZE: int = 1536
+    DEFAULT_IMAGE_SIZE: int = 1536
+
+    BACKBONE_CHOICES: dict[str, dict[str, object]] = {
+        "convnext_base.fb_in22k_ft_in1k": {
+            "image_size": 1536,
+            "summary": "Baseline ConvNeXt (strong CNN inductive biases)",
+        },
+        "vit_base_patch16_384": {
+            "image_size": 384,
+            "summary": "Vision Transformer with global token mixing",
+        },
+        "swin_base_patch4_window12_384": {
+            "image_size": 384,
+            "summary": "Swin Transformer with shifted windows",
+        },
+        "efficientnet_b4": {
+            "image_size": 380,
+            "summary": "Lightweight CNN with squeeze-excite blocks",
+        },
+    }
 
     # Optimisation
     MODEL_NAME: str = "convnext_base.fb_in22k_ft_in1k"
@@ -73,6 +100,33 @@ class Config:
 
     # Checkpointing
     CHECKPOINT_FILENAME: str = "coordinate_regressor.pth"
+
+    @classmethod
+    def validate_model_name(cls, name: Optional[str] = None) -> str:
+        model_name = name or cls.MODEL_NAME
+        if model_name not in cls.BACKBONE_CHOICES:
+            available = ", ".join(sorted(cls.BACKBONE_CHOICES))
+            raise ValueError(
+                f"Unknown MODEL_NAME '{model_name}'. Available options: {available}"
+            )
+        return model_name
+
+    @classmethod
+    def image_size(cls, model_name: Optional[str] = None) -> int:
+        resolved = cls.validate_model_name(model_name)
+        metadata = cls.BACKBONE_CHOICES.get(resolved, {})
+        return int(metadata.get("image_size", cls.DEFAULT_IMAGE_SIZE))
+
+    @classmethod
+    def describe_backbones(cls) -> str:
+        """Return a human-readable summary of available backbones."""
+
+        lines = []
+        for key, meta in cls.BACKBONE_CHOICES.items():
+            summary = meta.get("summary", "")
+            size = meta.get("image_size", cls.DEFAULT_IMAGE_SIZE)
+            lines.append(f"- {key}: {summary} (recommended {size}px square)")
+        return "\n".join(lines)
 
 
 os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
@@ -215,6 +269,7 @@ class FootballDataset(Dataset):
             raise ValueError(f"Filename {img_path} does not contain coordinates")
 
         keypoints = [(coords["x"], coords["y"])]
+        image_size = Config.image_size()
         if self.transform is not None:
             transformed = self.transform(image=image, keypoints=keypoints)
             image = transformed["image"]
@@ -226,10 +281,10 @@ class FootballDataset(Dataset):
                 return self.__getitem__((idx + 1) % len(self.valid_paths))
 
             clamped = []
-            limit = float(np.nextafter(Config.IMAGE_SIZE, -np.inf))
+            limit = float(np.nextafter(image_size, -np.inf))
             for kp in keypoints:
                 x, y = kp[:2]
-                if 0.0 <= x < Config.IMAGE_SIZE and 0.0 <= y < Config.IMAGE_SIZE:
+                if 0.0 <= x < image_size and 0.0 <= y < image_size:
                     clamped.append((min(max(x, 0.0), limit), min(max(y, 0.0), limit)))
             if not clamped:
                 return self.__getitem__((idx + 1) % len(self.valid_paths))
@@ -255,15 +310,15 @@ class FootballDataset(Dataset):
         else:
             tensor_image = tensor_image.to(dtype=torch.float32) / 255.0
 
-        if tensor_image.shape[-2:] != (Config.IMAGE_SIZE, Config.IMAGE_SIZE):
+        if tensor_image.shape[-2:] != (image_size, image_size):
             tensor_image = torch.nn.functional.interpolate(
                 tensor_image.unsqueeze(0),
-                size=(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+                size=(image_size, image_size),
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)
 
-        image_extent = float(Config.IMAGE_SIZE - 1)
+        image_extent = float(image_size - 1)
         keypoint = torch.tensor(keypoints[0], dtype=torch.float32)
         normalised = keypoint / image_extent
         normalised = normalised.clamp(0.0, 1.0)
@@ -281,8 +336,9 @@ class CoordinateRegressionModel(nn.Module):
 
     def __init__(self, backbone_name: str, pretrained: bool = True, hidden_dim: int = 512):
         super().__init__()
+        self.backbone_name = Config.validate_model_name(backbone_name)
         self.backbone = timm.create_model(
-            backbone_name,
+            self.backbone_name,
             pretrained=pretrained,
             num_classes=0,
             global_pool="",
@@ -308,10 +364,29 @@ class CoordinateRegressionModel(nn.Module):
         features = self.backbone.forward_features(x)
         if features.dim() == 3:
             # Some transformer-style backbones return (B, N, C). Reshape back to
-            # a spatial map by assuming a square token layout.
+            # a spatial map by assuming a square token layout.  Drop class or
+            # distillation tokens until we obtain a square number of patches.
             b, n, c = features.shape
+            spatial_tokens = features
             side = int(math.sqrt(n))
-            features = features.transpose(1, 2).reshape(b, c, side, side)
+            if side * side != n:
+                trimmed = False
+                for drop in (1, 2):
+                    candidate = n - drop
+                    if candidate <= 0:
+                        continue
+                    side_candidate = int(math.sqrt(candidate))
+                    if side_candidate * side_candidate == candidate:
+                        spatial_tokens = features[:, drop:, :]
+                        side = side_candidate
+                        trimmed = True
+                        break
+                if not trimmed and side * side != n:
+                    raise ValueError(
+                        f"Unable to reshape transformer tokens from {self.backbone_name}: "
+                        f"{n} tokens do not form a square map"
+                    )
+            features = spatial_tokens.transpose(1, 2).reshape(b, c, side, side)
 
         avg = self.avg_pool(features)
         maxv = self.max_pool(features)
@@ -321,7 +396,8 @@ class CoordinateRegressionModel(nn.Module):
 
 
 def create_model(pretrained: bool = True) -> CoordinateRegressionModel:
-    model = CoordinateRegressionModel(Config.MODEL_NAME, pretrained=pretrained)
+    backbone_name = Config.validate_model_name()
+    model = CoordinateRegressionModel(backbone_name, pretrained=pretrained)
     return model
 
 
@@ -343,7 +419,7 @@ class CoordinateLoss(nn.Module):
         target = target.to(dtype=torch.float32)
         smooth = self.smooth_l1(pred, target)
 
-        image_extent = max(float(Config.IMAGE_SIZE - 1), 1.0)
+        image_extent = max(float(Config.image_size() - 1), 1.0)
         pixel_errors = torch.abs(pred - target) * image_extent
         pixel_mae = pixel_errors.mean()
 
@@ -399,7 +475,7 @@ def prepare_dataloaders(
 
 
 def compute_pixel_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
-    image_extent = max(float(Config.IMAGE_SIZE - 1), 1.0)
+    image_extent = max(float(Config.image_size() - 1), 1.0)
     diff = (pred - target).detach()
     errors = torch.abs(diff) * image_extent
     mae = errors.mean().item()
@@ -520,7 +596,7 @@ def save_sample_predictions(
         preds = model(images).cpu()
 
     targets = targets.cpu()
-    image_extent = float(Config.IMAGE_SIZE - 1)
+    image_extent = float(Config.image_size() - 1)
     count = min(max_samples, images.size(0))
 
     fig, axes = plt.subplots(count, 1, figsize=(6, 4 * count))
@@ -655,30 +731,31 @@ def load_checkpoint(
 
 
 def build_transforms() -> dict:
+    image_size = Config.image_size()
     random_resized_crop_signature = inspect_signature(A.RandomResizedCrop)
     random_resized_crop_candidates: list[dict] = []
     if random_resized_crop_signature is None:
         # Prefer modern ``size`` signatures but keep height/width as a last resort.
         random_resized_crop_candidates.extend(
             [
-                {"size": Config.IMAGE_SIZE},
-                {"size": (Config.IMAGE_SIZE, Config.IMAGE_SIZE)},
-                {"size": [Config.IMAGE_SIZE, Config.IMAGE_SIZE]},
-                {"height": Config.IMAGE_SIZE, "width": Config.IMAGE_SIZE},
+                {"size": image_size},
+                {"size": (image_size, image_size)},
+                {"size": [image_size, image_size]},
+                {"height": image_size, "width": image_size},
             ]
         )
     else:
         if "size" in random_resized_crop_signature:
             random_resized_crop_candidates.extend(
                 [
-                    {"size": Config.IMAGE_SIZE},
-                    {"size": (Config.IMAGE_SIZE, Config.IMAGE_SIZE)},
-                    {"size": [Config.IMAGE_SIZE, Config.IMAGE_SIZE]},
+                    {"size": image_size},
+                    {"size": (image_size, image_size)},
+                    {"size": [image_size, image_size]},
                 ]
             )
         if {"height", "width"}.issubset(random_resized_crop_signature):
             random_resized_crop_candidates.append(
-                {"height": Config.IMAGE_SIZE, "width": Config.IMAGE_SIZE}
+                {"height": image_size, "width": image_size}
             )
 
     random_resized_crop = instantiate_albumentations_transform(
@@ -722,7 +799,7 @@ def build_transforms() -> dict:
 
     train_transform = A.Compose(
         [
-            A.OneOf([random_resized_crop, A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE)], p=1.0),
+            A.OneOf([random_resized_crop, A.Resize(image_size, image_size)], p=1.0),
             A.HorizontalFlip(p=0.5),
             affine,
             perspective,
@@ -737,7 +814,7 @@ def build_transforms() -> dict:
 
     warmup_transform = A.Compose(
         [
-            A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+            A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
             A.RandomBrightnessContrast(0.15, 0.1, p=0.35),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -748,7 +825,7 @@ def build_transforms() -> dict:
 
     val_transform = A.Compose(
         [
-            A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+            A.Resize(image_size, image_size),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
@@ -800,6 +877,9 @@ def main() -> None:
     print("Coordinate Regression Training")
     print(f"Device: {Config.DEVICE}")
     print(f"Model: {Config.MODEL_NAME}")
+    print(f"Input resolution: {Config.image_size()} px")
+    print("Backbone registry (set Config.MODEL_NAME to switch):")
+    print(Config.describe_backbones())
     print("=" * 80)
 
     train_files, val_files = gather_dataset_files()
