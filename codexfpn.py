@@ -752,10 +752,30 @@ class LossBalanceController:
             getattr(criterion, 'pixel_coord_weight', self.state.pixel_coord_loss_weight)
         )
 
+        penalty_for_balance = float(pixel_penalty)
+        log_scale = float(getattr(Config, 'PIXEL_LOSS_LOG_SCALE', 0.0))
+        if log_scale > 0.0:
+            # ``pixel_penalty`` is scaled by ``log_scale`` inside ``CombinedLoss`` so the
+            # optimiser keeps receiving gradients on the order of the raw MAE.  When we
+            # compare branch contributions, however, the inflated magnitude makes the
+            # regressor appear to dominate even after the balancer clamps its weight.  A
+            # more faithful proxy for the actual gradient pressure is the unscaled
+            # log-penalty (roughly ``log1p(error / log_scale)``), so we divide by the same
+            # factor here.  We also ensure the contribution never falls below the normalised
+            # pixel MAE so that, if the log penalty is disabled mid-run, the controller
+            # smoothly transitions back to MAE-based accounting.
+            penalty_for_balance = penalty_for_balance / log_scale
+            image_extent = max(float(Config.IMAGE_SIZE - 1), 1.0)
+            normalised_mae = float(pixel_loss) / image_extent
+            penalty_for_balance = max(penalty_for_balance, normalised_mae)
+        else:
+            penalty_for_balance = float(pixel_loss)
+
         weighted_losses = {
             'heatmap': heatmap_weight * heatmap_loss,
             'coord': coord_weight * coord_loss,
-            'pixel': pixel_weight * pixel_penalty,
+            'pixel': pixel_weight * penalty_for_balance,
+
         }
 
         total = weighted_losses['heatmap'] + weighted_losses['coord'] + weighted_losses['pixel']
