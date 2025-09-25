@@ -2,7 +2,7 @@ import math
 import os
 import random
 import re
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -71,9 +71,9 @@ class Config:
     # Optimisation
     MODEL_NAME: str = "convnext_base.fb_in22k_ft_in1k"
     BATCH_SIZE: int = 2
-    EPOCHS: int = 120
-    INITIAL_LR: float = 3e-4
-    BACKBONE_LR: float = 1e-4
+    EPOCHS: int = 200
+    INITIAL_LR: float = 1e-4
+    BACKBONE_LR: float = 1e-5
     WEIGHT_DECAY: float = 1e-5
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
@@ -512,6 +512,24 @@ def compute_pixel_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[flo
     return mae, rmse
 
 
+def compute_percentile_errors(
+    errors: Union[torch.Tensor, Sequence[float]],
+    percentiles: Sequence[float] = (50, 75, 90, 95),
+) -> Dict[str, float]:
+    """Return key percentiles from a collection of pixel errors."""
+
+    if isinstance(errors, torch.Tensor):
+        values = errors.detach().flatten().to(dtype=torch.float32)
+    else:
+        values = torch.tensor(list(errors), dtype=torch.float32)
+
+    if values.numel() == 0:
+        return {f"p{int(p)}": float("nan") for p in percentiles}
+
+    array = values.cpu().numpy()
+    return {f"p{int(p)}": float(np.percentile(array, p)) for p in percentiles}
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -576,11 +594,12 @@ def validate(
     loader: DataLoader,
     criterion: CoordinateLoss,
     epoch: int,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, Dict[str, float]]:
     model.eval()
     total_loss = 0.0
     total_coord = 0.0
     total_pixel = 0.0
+    pixel_errors: list[float] = []
 
     progress = tqdm(loader, desc=f"Val {epoch+1}", colour="yellow")
 
@@ -599,11 +618,27 @@ def validate(
             total_coord += coord_loss.item()
             total_pixel += pixel_mae.item()
 
+            image_extent = max(float(Config.image_size() - 1), 1.0)
+            batch_errors = torch.linalg.vector_norm((preds - targets) * image_extent, dim=-1)
+            if batch_errors.ndim == 0:
+                batch_errors = batch_errors.unsqueeze(0)
+            pixel_errors.extend(batch_errors.detach().cpu().tolist())
+
+            percentiles = compute_percentile_errors(pixel_errors)
+            progress.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "pix": f"{pixel_mae.item():.2f}",
+                    **{k: f"{v:.1f}" for k, v in percentiles.items()},
+                }
+            )
+
     batches = max(len(loader), 1)
     avg_loss = total_loss / batches
     avg_coord = total_coord / batches
     avg_pixel = total_pixel / batches
-    return avg_loss, avg_coord, avg_pixel
+    percentile_metrics = compute_percentile_errors(pixel_errors)
+    return avg_loss, avg_coord, avg_pixel, percentile_metrics
 
 
 def save_sample_predictions(
@@ -687,6 +722,11 @@ def save_sample_predictions(
             summary_lines.append(
                 f"Val Loss: {metrics['val_loss']:.4f} | Val MAE: {metrics['val_pixel']:.2f} px"
             )
+        if metrics.get("val_percentiles"):
+            percentile_summary = " | ".join(
+                f"{key.upper()}: {value:.1f} px" for key, value in metrics["val_percentiles"].items()
+            )
+            summary_lines.append(f"Val Percentiles -> {percentile_summary}")
         if "val_coord" in metrics:
             summary_lines.append(f"Val Coord MAE: {metrics['val_coord']:.4f}")
         if "best_val_mae" in metrics:
@@ -999,15 +1039,19 @@ def main() -> None:
         val_results: Optional[dict] = None
 
         if (epoch + 1) % Config.VALIDATE_EVERY == 0:
-            val_loss, val_coord, val_pixel = validate(model, val_loader, criterion, epoch)
+            val_loss, val_coord, val_pixel, val_percentiles = validate(
+                model, val_loader, criterion, epoch
+            )
             history.setdefault("train", []).append(train_loss)
             history.setdefault("val", []).append(val_loss)
             history.setdefault("val_mae", []).append(val_pixel)
+            history.setdefault("val_pixel_percentiles", []).append(val_percentiles)
 
             val_results = {
                 "loss": val_loss,
                 "coord": val_coord,
                 "pixel": val_pixel,
+                "percentiles": val_percentiles,
             }
 
             if val_pixel < best_val_mae:
@@ -1031,6 +1075,7 @@ def main() -> None:
                 "val_loss": val_loss,
                 "val_coord": val_coord,
                 "val_pixel": val_pixel,
+                "val_percentiles": val_percentiles,
                 "best_val_mae": best_val_mae,
             }
 
@@ -1057,11 +1102,14 @@ def main() -> None:
 
         if val_results is not None:
             delta_pixel = val_results["pixel"] - train_pixel
+            percentile_text = " | ".join(
+                f"{key.upper()}: {value:.1f} px" for key, value in val_results["percentiles"].items()
+            )
             print(
                 "Val   -> Loss: "
                 f"{val_results['loss']:.4f} | Coord MAE: {val_results['coord']:.4f} | "
                 f"Pixel MAE: {val_results['pixel']:.2f} px (Δ vs train: {delta_pixel:+.2f} px) | "
-                f"Best MAE: {best_val_mae:.2f} px"
+                f"{percentile_text} | Best MAE: {best_val_mae:.2f} px"
             )
         else:
             print("Val   -> Skipped (waiting for scheduled evaluation)")
