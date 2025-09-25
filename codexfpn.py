@@ -237,10 +237,19 @@ class FootballDataset(Dataset):
         tensor_image = image
         if isinstance(tensor_image, np.ndarray):
             tensor_image = torch.from_numpy(tensor_image.transpose(2, 0, 1))
-        tensor_image = tensor_image.float()
+        elif torch.is_tensor(tensor_image):
+            tensor_image = tensor_image.clone()
+        else:
+            tensor_image = torch.as_tensor(tensor_image)
 
-        if tensor_image.max() > 1.0:
-            tensor_image = tensor_image / 255.0
+        if tensor_image.dtype.is_floating_point:
+            tensor_image = tensor_image.to(dtype=torch.float32)
+            max_val = tensor_image.max().item()
+            min_val = tensor_image.min().item()
+            if min_val >= 0.0 and max_val > 1.0:
+                tensor_image = tensor_image / 255.0
+        else:
+            tensor_image = tensor_image.to(dtype=torch.float32) / 255.0
 
         if tensor_image.shape[-2:] != (Config.IMAGE_SIZE, Config.IMAGE_SIZE):
             tensor_image = torch.nn.functional.interpolate(
