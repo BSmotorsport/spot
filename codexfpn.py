@@ -49,19 +49,23 @@ class Config:
     WEIGHT_DECAY: float = 1e-5
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
-    GRAD_ACCUM_STEPS: int = 4
+    GRAD_ACCUM_STEPS: int = 1
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     AMP: bool = torch.cuda.is_available()
     USE_CHANNELS_LAST: bool = True
+
+    LR_WARMUP_EPOCHS: int = 10
+    LR_WARMUP_START_FACTOR: float = 0.2
+    AUG_WARMUP_EPOCHS: int = 10
 
     NORMALIZE_MEAN: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     NORMALIZE_STD: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     # Training stages
-    FREEZE_BACKBONE_EPOCHS: int = 2
+    FREEZE_BACKBONE_EPOCHS: int = 0
 
     # Loss
-    PIXEL_LOSS_WEIGHT: float = 1.0
+    PIXEL_LOSS_WEIGHT: float = 0.4
 
     # Validation utilities
     VALIDATE_EVERY: int = 1
@@ -637,7 +641,7 @@ def load_checkpoint(
 # ======================================================================================
 
 
-def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
+def build_transforms() -> dict:
     random_resized_crop_signature = inspect_signature(A.RandomResizedCrop)
     random_resized_crop_candidates: list[dict] = []
     if random_resized_crop_signature is None:
@@ -666,13 +670,13 @@ def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
 
     random_resized_crop = instantiate_albumentations_transform(
         A.RandomResizedCrop,
-        dict(scale=(0.55, 1.0), ratio=(0.75, 1.33), interpolation=cv2.INTER_CUBIC),
+        dict(scale=(0.7, 1.0), ratio=(0.85, 1.2), interpolation=cv2.INTER_CUBIC),
         random_resized_crop_candidates,
     )
 
     affine = instantiate_albumentations_transform(
         A.Affine,
-        dict(scale=(0.9, 1.1), rotate=(-8, 8), shear=(-4, 4), fit_output=False, p=0.4),
+        dict(scale=(0.92, 1.08), rotate=(-6, 6), shear=(-3, 3), fit_output=False, p=0.3),
         [
             {"cval": 0, "mode": cv2.BORDER_REFLECT_101},
             {"value": 0, "border_mode": cv2.BORDER_REFLECT_101},
@@ -682,7 +686,7 @@ def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
 
     perspective = instantiate_albumentations_transform(
         A.Perspective,
-        dict(scale=(0.02, 0.05), keep_size=True, p=0.25),
+        dict(scale=(0.015, 0.04), keep_size=True, p=0.15),
         [
             {"pad_mode": cv2.BORDER_REFLECT_101},
             {"border_mode": cv2.BORDER_REFLECT_101},
@@ -696,13 +700,24 @@ def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
             A.HorizontalFlip(p=0.5),
             affine,
             perspective,
-            A.RandomBrightnessContrast(0.25, 0.2, p=0.5),
-            A.ColorJitter(0.12, 0.12, 0.12, 0.05, p=0.3),
-            A.GaussNoise(p=0.3),
+            A.RandomBrightnessContrast(0.2, 0.15, p=0.45),
+            A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=0.25),
+            A.GaussNoise(var_limit=(0.0, 10.0), p=0.2),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
         keypoint_params=A.KeypointParams(format="xy", remove_invisible=True),
+    )
+
+    warmup_transform = A.Compose(
+        [
+            A.Resize(Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(0.15, 0.1, p=0.35),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ],
+        keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
     )
 
     val_transform = A.Compose(
@@ -714,7 +729,11 @@ def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
         keypoint_params=A.KeypointParams(format="xy"),
     )
 
-    return train_transform, val_transform
+    return {
+        "train": train_transform,
+        "warmup": warmup_transform,
+        "val": val_transform,
+    }
 
 
 def group_files_by_scene(files: Sequence[str]) -> dict:
@@ -758,8 +777,24 @@ def main() -> None:
     print("=" * 80)
 
     train_files, val_files = gather_dataset_files()
-    train_transform, val_transform = build_transforms()
-    train_loader, val_loader = prepare_dataloaders(train_files, val_files, train_transform, val_transform)
+    transforms = build_transforms()
+    full_train_transform = transforms.get("train")
+    warmup_transform = transforms.get("warmup")
+    val_transform = transforms.get("val")
+
+    if full_train_transform is None or val_transform is None:
+        raise ValueError("build_transforms() must provide 'train' and 'val' transforms")
+
+    initial_train_transform = full_train_transform
+    if Config.AUG_WARMUP_EPOCHS > 0 and warmup_transform is not None:
+        initial_train_transform = warmup_transform
+
+    train_loader, val_loader = prepare_dataloaders(
+        train_files,
+        val_files,
+        initial_train_transform,
+        val_transform,
+    )
 
     model = create_model(pretrained=True).to(Config.DEVICE)
 
@@ -777,15 +812,58 @@ def main() -> None:
         weight_decay=Config.WEIGHT_DECAY,
     )
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=Config.BACKBONE_LR * 0.1)
+    warmup_epochs = max(Config.LR_WARMUP_EPOCHS, 0)
+    schedulers = []
+    milestones = []
+    if warmup_epochs > 0:
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=max(Config.LR_WARMUP_START_FACTOR, 0.0),
+            total_iters=warmup_epochs,
+        )
+        schedulers.append(warmup_scheduler)
+        milestones.append(warmup_epochs)
+
+    cosine_epochs = max(Config.EPOCHS - warmup_epochs, 1)
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_epochs,
+        eta_min=Config.BACKBONE_LR * 0.1,
+    )
+    schedulers.append(cosine_scheduler)
+
+    if len(schedulers) == 1:
+        scheduler = cosine_scheduler
+    else:
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=schedulers,
+            milestones=milestones,
+        )
 
     criterion = CoordinateLoss(pixel_weight=Config.PIXEL_LOSS_WEIGHT)
     scaler = GradScaler(enabled=Config.AMP)
 
     start_epoch, best_val_mae, history = load_checkpoint(model, optimizer, scheduler, scaler)
 
+    use_warmup_aug = Config.AUG_WARMUP_EPOCHS > 0 and warmup_transform is not None
+    if use_warmup_aug and start_epoch >= Config.AUG_WARMUP_EPOCHS:
+        train_loader.dataset.transform = full_train_transform
+        augmentation_swapped = True
+    elif use_warmup_aug:
+        train_loader.dataset.transform = warmup_transform
+        augmentation_swapped = False
+    else:
+        train_loader.dataset.transform = full_train_transform
+        augmentation_swapped = True
+
     for epoch in range(start_epoch, Config.EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.EPOCHS}")
+
+        if use_warmup_aug and not augmentation_swapped and epoch >= Config.AUG_WARMUP_EPOCHS:
+            print("\nEnabling full augmentation pipeline")
+            train_loader.dataset.transform = full_train_transform
+            augmentation_swapped = True
 
         if Config.FREEZE_BACKBONE_EPOCHS and epoch == Config.FREEZE_BACKBONE_EPOCHS:
             print("\nUnfreezing backbone for fine-tuning")
