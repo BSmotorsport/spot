@@ -583,15 +583,36 @@ def load_checkpoint(
 
 
 def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
+    random_resized_crop_signature = inspect_signature(A.RandomResizedCrop)
+    random_resized_crop_candidates: list[dict] = []
+    if random_resized_crop_signature is None:
+        # Prefer modern ``size`` signatures but keep height/width as a last resort.
+        random_resized_crop_candidates.extend(
+            [
+                {"size": Config.IMAGE_SIZE},
+                {"size": (Config.IMAGE_SIZE, Config.IMAGE_SIZE)},
+                {"size": [Config.IMAGE_SIZE, Config.IMAGE_SIZE]},
+                {"height": Config.IMAGE_SIZE, "width": Config.IMAGE_SIZE},
+            ]
+        )
+    else:
+        if "size" in random_resized_crop_signature:
+            random_resized_crop_candidates.extend(
+                [
+                    {"size": Config.IMAGE_SIZE},
+                    {"size": (Config.IMAGE_SIZE, Config.IMAGE_SIZE)},
+                    {"size": [Config.IMAGE_SIZE, Config.IMAGE_SIZE]},
+                ]
+            )
+        if {"height", "width"}.issubset(random_resized_crop_signature):
+            random_resized_crop_candidates.append(
+                {"height": Config.IMAGE_SIZE, "width": Config.IMAGE_SIZE}
+            )
+
     random_resized_crop = instantiate_albumentations_transform(
         A.RandomResizedCrop,
         dict(scale=(0.55, 1.0), ratio=(0.75, 1.33), interpolation=cv2.INTER_CUBIC),
-        [
-            {"height": Config.IMAGE_SIZE, "width": Config.IMAGE_SIZE},
-            {"size": Config.IMAGE_SIZE},
-            {"size": (Config.IMAGE_SIZE, Config.IMAGE_SIZE)},
-            {"size": [Config.IMAGE_SIZE, Config.IMAGE_SIZE]},
-        ],
+        random_resized_crop_candidates,
     )
 
     affine = instantiate_albumentations_transform(
