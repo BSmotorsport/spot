@@ -583,12 +583,15 @@ def load_checkpoint(
 
 
 def build_transforms() -> Tuple[A.BasicTransform, A.BasicTransform]:
-    random_resized_crop = A.RandomResizedCrop(
-        height=Config.IMAGE_SIZE,
-        width=Config.IMAGE_SIZE,
-        scale=(0.55, 1.0),
-        ratio=(0.75, 1.33),
-        interpolation=cv2.INTER_CUBIC,
+    random_resized_crop = instantiate_albumentations_transform(
+        A.RandomResizedCrop,
+        dict(scale=(0.55, 1.0), ratio=(0.75, 1.33), interpolation=cv2.INTER_CUBIC),
+        [
+            {"height": Config.IMAGE_SIZE, "width": Config.IMAGE_SIZE},
+            {"size": Config.IMAGE_SIZE},
+            {"size": (Config.IMAGE_SIZE, Config.IMAGE_SIZE)},
+            {"size": [Config.IMAGE_SIZE, Config.IMAGE_SIZE]},
+        ],
     )
 
     affine = instantiate_albumentations_transform(
