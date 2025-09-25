@@ -74,13 +74,21 @@ class Config:
     EPOCHS: int = 200
     INITIAL_LR: float = 1e-4
     BACKBONE_LR: float = 1e-5
-    WEIGHT_DECAY: float = 1e-5
+    WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
     GRAD_ACCUM_STEPS: int = 1
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     AMP: bool = torch.cuda.is_available()
     USE_CHANNELS_LAST: bool = True
+
+    DROP_PATH_RATE: float = 0.1
+    HEAD_DROPOUT: float = 0.25
+
+    MIXUP_ALPHA: float = 0.0
+    CUTMIX_ALPHA: float = 0.0
+    MIXUP_PROB: float = 0.0
+    MIXUP_SWITCH_PROB: float = 0.5
 
     LR_WARMUP_EPOCHS: int = 10
     LR_WARMUP_START_FACTOR: float = 0.2
@@ -358,6 +366,7 @@ class CoordinateRegressionModel(nn.Module):
             pretrained=pretrained,
             num_classes=0,
             global_pool="",
+            drop_path_rate=Config.DROP_PATH_RATE,
         )
         if hasattr(self.backbone, "set_grad_checkpointing"):
             self.backbone.set_grad_checkpointing(True)
@@ -379,9 +388,10 @@ class CoordinateRegressionModel(nn.Module):
         self.gem_pool = GeM()
         self.head = nn.Sequential(
             nn.LayerNorm(feature_dim * 3),
+            nn.Dropout(Config.HEAD_DROPOUT),
             nn.Linear(feature_dim * 3, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(Config.HEAD_DROPOUT),
             nn.Linear(hidden_dim, 2),
         )
 
@@ -530,6 +540,94 @@ def compute_percentile_errors(
     return {f"p{int(p)}": float(np.percentile(array, p)) for p in percentiles}
 
 
+class MixupCutmix:
+    """Apply MixUp/CutMix augmentations and interpolate coordinate targets."""
+
+    def __init__(
+        self,
+        mixup_alpha: float = 0.0,
+        cutmix_alpha: float = 0.0,
+        prob: float = 0.0,
+        switch_prob: float = 0.5,
+    ) -> None:
+        self.mixup_alpha = max(float(mixup_alpha), 0.0)
+        self.cutmix_alpha = max(float(cutmix_alpha), 0.0)
+        self.prob = max(float(prob), 0.0)
+        self.switch_prob = float(np.clip(switch_prob, 0.0, 1.0))
+
+    def _sample_beta(self, alpha: float) -> float:
+        if alpha <= 0:
+            return 1.0
+        return float(np.random.beta(alpha, alpha))
+
+    def _mixup(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = images.size(0)
+        if batch_size < 2:
+            return images, targets
+        lam = self._sample_beta(self.mixup_alpha)
+        perm = torch.randperm(batch_size, device=images.device)
+        mixed_images = lam * images + (1.0 - lam) * images[perm]
+        mixed_targets = lam * targets + (1.0 - lam) * targets[perm]
+        return mixed_images, mixed_targets
+
+    def _rand_bbox(self, size: Sequence[int], lam: float) -> Tuple[int, int, int, int]:
+        width = size[-1]
+        height = size[-2]
+        cut_ratio = math.sqrt(max(0.0, 1.0 - lam))
+        cut_w = int(width * cut_ratio)
+        cut_h = int(height * cut_ratio)
+
+        # Uniformly sample the centre of the rectangle.
+        cx = random.randint(0, width - 1)
+        cy = random.randint(0, height - 1)
+
+        x1 = max(cx - cut_w // 2, 0)
+        x2 = min(cx + cut_w // 2, width)
+        y1 = max(cy - cut_h // 2, 0)
+        y2 = min(cy + cut_h // 2, height)
+
+        return x1, y1, x2, y2
+
+    def _cutmix(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = images.size(0)
+        if batch_size < 2:
+            return images, targets
+
+        lam = self._sample_beta(self.cutmix_alpha)
+        perm = torch.randperm(batch_size, device=images.device)
+        shuffled = images[perm]
+
+        x1, y1, x2, y2 = self._rand_bbox(images.size(), lam)
+        if x1 == x2 or y1 == y2:
+            return images, targets
+
+        mixed = images.clone()
+        mixed[:, :, y1:y2, x1:x2] = shuffled[:, :, y1:y2, x1:x2]
+
+        area = (x2 - x1) * (y2 - y1)
+        total_area = images.size(-1) * images.size(-2)
+        lam_adjusted = 1.0 - float(area) / float(total_area)
+        mixed_targets = lam_adjusted * targets + (1.0 - lam_adjusted) * targets[perm]
+        return mixed, mixed_targets
+
+    def __call__(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.prob <= 0.0:
+            return images, targets
+
+        if random.random() > self.prob:
+            return images, targets
+
+        if self.mixup_alpha > 0.0 and self.cutmix_alpha > 0.0:
+            if random.random() < self.switch_prob:
+                return self._mixup(images, targets)
+            return self._cutmix(images, targets)
+        if self.mixup_alpha > 0.0:
+            return self._mixup(images, targets)
+        if self.cutmix_alpha > 0.0:
+            return self._cutmix(images, targets)
+        return images, targets
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -537,6 +635,7 @@ def train_one_epoch(
     criterion: CoordinateLoss,
     scaler: GradScaler,
     epoch: int,
+    mixup_fn: Optional[MixupCutmix] = None,
 ) -> Tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -550,6 +649,8 @@ def train_one_epoch(
     for images, targets, _ in progress:
         images = images.to(Config.DEVICE, non_blocking=True)
         targets = targets.to(Config.DEVICE, non_blocking=True)
+        if mixup_fn is not None:
+            images, targets = mixup_fn(images, targets)
         if Config.USE_CHANNELS_LAST:
             images = images.to(memory_format=torch.channels_last)
 
@@ -1028,6 +1129,15 @@ def main() -> None:
 
     val_loader = build_val_loader(val_files, val_transform)
 
+    mixup_fn: Optional[MixupCutmix] = None
+    if Config.MIXUP_PROB > 0.0 and (Config.MIXUP_ALPHA > 0.0 or Config.CUTMIX_ALPHA > 0.0):
+        mixup_fn = MixupCutmix(
+            mixup_alpha=Config.MIXUP_ALPHA,
+            cutmix_alpha=Config.CUTMIX_ALPHA,
+            prob=Config.MIXUP_PROB,
+            switch_prob=Config.MIXUP_SWITCH_PROB,
+        )
+
     for epoch in range(start_epoch, Config.EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.EPOCHS}")
 
@@ -1041,7 +1151,15 @@ def main() -> None:
             for param in model.backbone.parameters():
                 param.requires_grad = True
 
-        train_loss, train_coord, train_pixel = train_one_epoch(model, train_loader, optimizer, criterion, scaler, epoch)
+        train_loss, train_coord, train_pixel = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            scaler,
+            epoch,
+            mixup_fn=mixup_fn,
+        )
         scheduler.step()
 
         val_results: Optional[dict] = None
