@@ -775,6 +775,7 @@ class LossBalanceController:
             'heatmap': heatmap_weight * heatmap_loss,
             'coord': coord_weight * coord_loss,
             'pixel': pixel_weight * penalty_for_balance,
+
         }
 
         total = weighted_losses['heatmap'] + weighted_losses['coord'] + weighted_losses['pixel']
