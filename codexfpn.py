@@ -572,10 +572,45 @@ class MixupCutmix:
         mixed_images = images.clone()
         mixed_images[:, :, bby1:bby2, bbx1:bbx2] = images[index, :, bby1:bby2, bbx1:bbx2]
 
-        area = (bbx2 - bbx1) * (bby2 - bby1)
-        total_area = images.size(-1) * images.size(-2)
-        lam_adjusted = 1.0 - float(area) / float(max(total_area, 1))
-        mixed_targets = lam_adjusted * targets + (1.0 - lam_adjusted) * targets[index]
+        shuffled_targets = targets[index]
+
+        width = images.size(-1)
+        height = images.size(-2)
+        scale = torch.tensor(
+            [max(width - 1, 1), max(height - 1, 1)],
+            dtype=targets.dtype,
+            device=targets.device,
+        )
+
+        primary_pixels = targets * scale
+        secondary_pixels = shuffled_targets * scale
+
+        def _in_bbox(pixel_coords: torch.Tensor) -> torch.Tensor:
+            return (
+                (pixel_coords[:, 0] >= bbx1)
+                & (pixel_coords[:, 0] < bbx2)
+                & (pixel_coords[:, 1] >= bby1)
+                & (pixel_coords[:, 1] < bby2)
+            )
+
+        primary_in_patch = _in_bbox(primary_pixels)
+        secondary_in_patch = _in_bbox(secondary_pixels)
+
+        mixed_targets = targets.clone()
+
+        # When the original keypoint lies inside the pasted region but the replacement sample
+        # does not provide a visible keypoint, revert the patch for those batch elements to
+        # avoid mismatched labels.
+        invalid_mask = primary_in_patch & ~secondary_in_patch
+        if torch.any(invalid_mask):
+            mixed_images[invalid_mask, :, bby1:bby2, bbx1:bbx2] = images[
+                invalid_mask, :, bby1:bby2, bbx1:bbx2
+            ]
+            primary_in_patch = primary_in_patch & ~invalid_mask
+            secondary_in_patch = secondary_in_patch & ~invalid_mask
+
+        replace_mask = primary_in_patch & secondary_in_patch
+        mixed_targets[replace_mask] = shuffled_targets[replace_mask]
         return mixed_images, mixed_targets
 
     @staticmethod
@@ -634,94 +669,6 @@ def compute_percentile_errors(
 
     array = values.cpu().numpy()
     return {f"p{int(p)}": float(np.percentile(array, p)) for p in percentiles}
-
-
-class MixupCutmix:
-    """Apply MixUp/CutMix augmentations and interpolate coordinate targets."""
-
-    def __init__(
-        self,
-        mixup_alpha: float = 0.0,
-        cutmix_alpha: float = 0.0,
-        prob: float = 0.0,
-        switch_prob: float = 0.5,
-    ) -> None:
-        self.mixup_alpha = max(float(mixup_alpha), 0.0)
-        self.cutmix_alpha = max(float(cutmix_alpha), 0.0)
-        self.prob = max(float(prob), 0.0)
-        self.switch_prob = float(np.clip(switch_prob, 0.0, 1.0))
-
-    def _sample_beta(self, alpha: float) -> float:
-        if alpha <= 0:
-            return 1.0
-        return float(np.random.beta(alpha, alpha))
-
-    def _mixup(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = images.size(0)
-        if batch_size < 2:
-            return images, targets
-        lam = self._sample_beta(self.mixup_alpha)
-        perm = torch.randperm(batch_size, device=images.device)
-        mixed_images = lam * images + (1.0 - lam) * images[perm]
-        mixed_targets = lam * targets + (1.0 - lam) * targets[perm]
-        return mixed_images, mixed_targets
-
-    def _rand_bbox(self, size: Sequence[int], lam: float) -> Tuple[int, int, int, int]:
-        width = size[-1]
-        height = size[-2]
-        cut_ratio = math.sqrt(max(0.0, 1.0 - lam))
-        cut_w = int(width * cut_ratio)
-        cut_h = int(height * cut_ratio)
-
-        # Uniformly sample the centre of the rectangle.
-        cx = random.randint(0, width - 1)
-        cy = random.randint(0, height - 1)
-
-        x1 = max(cx - cut_w // 2, 0)
-        x2 = min(cx + cut_w // 2, width)
-        y1 = max(cy - cut_h // 2, 0)
-        y2 = min(cy + cut_h // 2, height)
-
-        return x1, y1, x2, y2
-
-    def _cutmix(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = images.size(0)
-        if batch_size < 2:
-            return images, targets
-
-        lam = self._sample_beta(self.cutmix_alpha)
-        perm = torch.randperm(batch_size, device=images.device)
-        shuffled = images[perm]
-
-        x1, y1, x2, y2 = self._rand_bbox(images.size(), lam)
-        if x1 == x2 or y1 == y2:
-            return images, targets
-
-        mixed = images.clone()
-        mixed[:, :, y1:y2, x1:x2] = shuffled[:, :, y1:y2, x1:x2]
-
-        area = (x2 - x1) * (y2 - y1)
-        total_area = images.size(-1) * images.size(-2)
-        lam_adjusted = 1.0 - float(area) / float(total_area)
-        mixed_targets = lam_adjusted * targets + (1.0 - lam_adjusted) * targets[perm]
-        return mixed, mixed_targets
-
-    def __call__(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.prob <= 0.0:
-            return images, targets
-
-        if random.random() > self.prob:
-            return images, targets
-
-        if self.mixup_alpha > 0.0 and self.cutmix_alpha > 0.0:
-            if random.random() < self.switch_prob:
-                return self._mixup(images, targets)
-            return self._cutmix(images, targets)
-        if self.mixup_alpha > 0.0:
-            return self._mixup(images, targets)
-        if self.cutmix_alpha > 0.0:
-            return self._cutmix(images, targets)
-        return images, targets
 
 
 def train_one_epoch(
