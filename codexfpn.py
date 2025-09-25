@@ -72,8 +72,8 @@ class Config:
     MODEL_NAME: str = "convnext_base.fb_in22k_ft_in1k"
     BATCH_SIZE: int = 2
     EPOCHS: int = 200
-    INITIAL_LR: float = 1e-4
-    BACKBONE_LR: float = 1e-5
+    INITIAL_LR: float = 5e-5
+    BACKBONE_LR: float = 5e-6
     WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
@@ -1154,6 +1154,16 @@ def main() -> None:
     print(f"Device: {Config.DEVICE}")
     print(f"Model: {Config.MODEL_NAME}")
     print(f"Input resolution: {Config.image_size()} px")
+    print(
+        "Learning rates: head={head:.2e}, backbone={backbone:.2e}".format(
+            head=Config.INITIAL_LR, backbone=Config.BACKBONE_LR
+        )
+    )
+    print(
+        "Cosine annealing eta_min (backbone scale): {eta:.2e}".format(
+            eta=Config.BACKBONE_LR * 0.1
+        )
+    )
     print("Backbone registry (set Config.MODEL_NAME to switch):")
     print(Config.describe_backbones())
     print("=" * 80)
@@ -1196,10 +1206,11 @@ def main() -> None:
         milestones.append(warmup_epochs)
 
     cosine_epochs = max(Config.EPOCHS - warmup_epochs, 1)
+    min_backbone_lr = Config.BACKBONE_LR * 0.1
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cosine_epochs,
-        eta_min=Config.BACKBONE_LR * 0.1,
+        eta_min=min_backbone_lr,
     )
     schedulers.append(cosine_scheduler)
 
