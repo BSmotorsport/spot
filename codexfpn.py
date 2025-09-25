@@ -74,6 +74,7 @@ class Config:
     EPOCHS: int = 200
     INITIAL_LR: float = 1e-4
     BACKBONE_LR: float = 2e-5
+
     WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
@@ -1051,6 +1052,7 @@ def build_transforms() -> dict:
     random_resized_crop = instantiate_albumentations_transform(
         A.RandomResizedCrop,
         dict(scale=(0.7, 1.0), ratio=(0.9, 1.1), interpolation=cv2.INTER_CUBIC),
+
         random_resized_crop_candidates,
     )
 
@@ -1101,6 +1103,7 @@ def build_transforms() -> dict:
                 [
                     A.MotionBlur(blur_limit=5),
                     A.GaussianBlur(blur_limit=(3, 5)),
+
                 ],
                 p=0.2,
             ),
