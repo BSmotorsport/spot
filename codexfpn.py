@@ -120,13 +120,13 @@ def instantiate_albumentations_transform(
                 continue
         try:
             return transform_cls(**common_kwargs, **filtered)
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
             errors.append(str(exc))
             continue
 
     try:
         return transform_cls(**common_kwargs)
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:
         errors.append(str(exc))
         attempted.append({})
         raise TypeError(
