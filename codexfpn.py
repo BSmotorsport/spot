@@ -2,7 +2,7 @@ import math
 import os
 import random
 import re
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -74,13 +74,22 @@ class Config:
     EPOCHS: int = 200
     INITIAL_LR: float = 1e-4
     BACKBONE_LR: float = 1e-5
-    WEIGHT_DECAY: float = 1e-5
+    WEIGHT_DECAY: float = 1e-4
     NUM_WORKERS: int = 4
     RANDOM_SEED: int = 42
     GRAD_ACCUM_STEPS: int = 1
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     AMP: bool = torch.cuda.is_available()
     USE_CHANNELS_LAST: bool = True
+
+    DROP_PATH_RATE: float = 0.1
+    HEAD_DROPOUT: float = 0.25
+
+    MIXUP_ALPHA: float = 0.0
+    CUTMIX_ALPHA: float = 0.0
+    MIXUP_PROB: float = 0.0
+    MIXUP_SWITCH_PROB: float = 0.5
+    MIXUP_MODE: str = "batch"
 
     LR_WARMUP_EPOCHS: int = 10
     LR_WARMUP_START_FACTOR: float = 0.2
@@ -358,6 +367,7 @@ class CoordinateRegressionModel(nn.Module):
             pretrained=pretrained,
             num_classes=0,
             global_pool="",
+            drop_path_rate=Config.DROP_PATH_RATE,
         )
         if hasattr(self.backbone, "set_grad_checkpointing"):
             self.backbone.set_grad_checkpointing(True)
@@ -379,9 +389,10 @@ class CoordinateRegressionModel(nn.Module):
         self.gem_pool = GeM()
         self.head = nn.Sequential(
             nn.LayerNorm(feature_dim * 3),
+            nn.Dropout(Config.HEAD_DROPOUT),
             nn.Linear(feature_dim * 3, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(Config.HEAD_DROPOUT),
             nn.Linear(hidden_dim, 2),
         )
 
@@ -503,6 +514,99 @@ def prepare_dataloaders(
     return train_loader, val_loader
 
 
+class MixupCutmix:
+    """Apply mixup or cutmix augmentation to batches when enabled."""
+
+    def __init__(
+        self,
+        mixup_alpha: float,
+        cutmix_alpha: float,
+        prob: float,
+        switch_prob: float,
+        mode: str = "batch",
+    ) -> None:
+        self.mixup_alpha = max(mixup_alpha, 0.0)
+        self.cutmix_alpha = max(cutmix_alpha, 0.0)
+        self.prob = max(prob, 0.0)
+        self.switch_prob = min(max(switch_prob, 0.0), 1.0)
+        self.mode = mode
+
+    def __call__(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if images.size(0) < 2:
+            return images, targets
+        if random.random() >= self.prob:
+            return images, targets
+
+        use_cutmix = False
+        if self.cutmix_alpha > 0.0 and self.mixup_alpha > 0.0:
+            use_cutmix = random.random() < self.switch_prob
+        elif self.cutmix_alpha > 0.0:
+            use_cutmix = True
+
+        if use_cutmix:
+            return self._apply_cutmix(images, targets)
+        if self.mixup_alpha > 0.0:
+            return self._apply_mixup(images, targets)
+        return images, targets
+
+    def _sample_lambda(self, alpha: float) -> float:
+        lam = np.random.beta(alpha, alpha)
+        return float(np.clip(lam, 0.0, 1.0))
+
+    def _apply_mixup(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        lam = self._sample_lambda(self.mixup_alpha)
+        index = torch.randperm(images.size(0), device=images.device)
+        mixed_images = lam * images + (1.0 - lam) * images[index]
+        mixed_targets = lam * targets + (1.0 - lam) * targets[index]
+        return mixed_images, mixed_targets
+
+    def _apply_cutmix(self, images: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        lam = self._sample_lambda(self.cutmix_alpha)
+        index = torch.randperm(images.size(0), device=images.device)
+        bbx1, bby1, bbx2, bby2 = self._rand_bbox(images.shape, lam)
+        if bbx1 >= bbx2 or bby1 >= bby2:
+            return self._apply_mixup(images, targets) if self.mixup_alpha > 0.0 else (images, targets)
+
+        mixed_images = images.clone()
+        mixed_images[:, :, bby1:bby2, bbx1:bbx2] = images[index, :, bby1:bby2, bbx1:bbx2]
+
+        area = (bbx2 - bbx1) * (bby2 - bby1)
+        total_area = images.size(-1) * images.size(-2)
+        lam_adjusted = 1.0 - float(area) / float(max(total_area, 1))
+        mixed_targets = lam_adjusted * targets + (1.0 - lam_adjusted) * targets[index]
+        return mixed_images, mixed_targets
+
+    @staticmethod
+    def _rand_bbox(size: Sequence[int], lam: float) -> Tuple[int, int, int, int]:
+        _, _, height, width = size
+        cut_ratio = math.sqrt(max(1.0 - lam, 0.0))
+        cut_w = int(width * cut_ratio)
+        cut_h = int(height * cut_ratio)
+
+        cx = random.randint(0, max(width - 1, 0))
+        cy = random.randint(0, max(height - 1, 0))
+
+        x1 = max(cx - cut_w // 2, 0)
+        y1 = max(cy - cut_h // 2, 0)
+        x2 = min(cx + cut_w // 2, width)
+        y2 = min(cy + cut_h // 2, height)
+        return x1, y1, x2, y2
+
+
+def create_mixup_cutmix_fn() -> Optional[Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]]:
+    if Config.MIXUP_PROB <= 0.0:
+        return None
+    if Config.MIXUP_ALPHA <= 0.0 and Config.CUTMIX_ALPHA <= 0.0:
+        return None
+    return MixupCutmix(
+        mixup_alpha=Config.MIXUP_ALPHA,
+        cutmix_alpha=Config.CUTMIX_ALPHA,
+        prob=Config.MIXUP_PROB,
+        switch_prob=Config.MIXUP_SWITCH_PROB,
+        mode=Config.MIXUP_MODE,
+    )
+
+
 def compute_pixel_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
     image_extent = max(float(Config.image_size() - 1), 1.0)
     diff = (pred - target).detach()
@@ -537,6 +641,7 @@ def train_one_epoch(
     criterion: CoordinateLoss,
     scaler: GradScaler,
     epoch: int,
+    mixup_fn: Optional[Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> Tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -550,6 +655,8 @@ def train_one_epoch(
     for images, targets, _ in progress:
         images = images.to(Config.DEVICE, non_blocking=True)
         targets = targets.to(Config.DEVICE, non_blocking=True)
+        if mixup_fn is not None:
+            images, targets = mixup_fn(images, targets)
         if Config.USE_CHANNELS_LAST:
             images = images.to(memory_format=torch.channels_last)
 
@@ -1027,6 +1134,7 @@ def main() -> None:
         augmentation_swapped = True
 
     val_loader = build_val_loader(val_files, val_transform)
+    mixup_cutmix_fn = create_mixup_cutmix_fn()
 
     for epoch in range(start_epoch, Config.EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.EPOCHS}")
@@ -1041,7 +1149,15 @@ def main() -> None:
             for param in model.backbone.parameters():
                 param.requires_grad = True
 
-        train_loss, train_coord, train_pixel = train_one_epoch(model, train_loader, optimizer, criterion, scaler, epoch)
+        train_loss, train_coord, train_pixel = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            scaler,
+            epoch,
+            mixup_fn=mixup_cutmix_fn,
+        )
         scheduler.step()
 
         val_results: Optional[dict] = None
