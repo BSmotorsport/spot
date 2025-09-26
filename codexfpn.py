@@ -1,4 +1,5 @@
 import csv
+import json
 import math
 import os
 import random
@@ -112,6 +113,14 @@ class Config:
     LOSS_MAX_VARIANCE: float = 10.0
     LOSS_VARIANCE_REG_WEIGHT: float = 0.01
     USE_UNCERTAINTY: bool = False
+
+    # Context metadata / auxiliary cues
+    CONTEXT_METADATA_ENABLED: bool = False
+    CONTEXT_METADATA_SUFFIX: str = ".context.json"
+    CONTEXT_VECTOR_SIZE: int = 128
+    CONTEXT_DEFAULT_FILL_VALUE: float = 0.0
+    CONTEXT_HIDDEN_DIM: int = 256
+    USE_CONTEXT_BRANCH: bool = False
 
     # Validation utilities
     VALIDATE_EVERY: int = 1
@@ -252,6 +261,79 @@ def parse_filename(filename: str) -> Optional[dict]:
     return {"x": float(x_coord), "y": float(y_coord)}
 
 
+def _context_metadata_path(image_path: str) -> str:
+    suffix = Config.CONTEXT_METADATA_SUFFIX
+    base, ext = os.path.splitext(image_path)
+    if suffix.startswith("."):
+        return base + suffix
+    return image_path + suffix
+
+
+def _flatten_numeric_structure(value) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return [float(value)]
+    if isinstance(value, np.ndarray):
+        return value.astype(np.float32).ravel().tolist()
+    if isinstance(value, (list, tuple, set)):
+        flattened: list[float] = []
+        for item in value:
+            flattened.extend(_flatten_numeric_structure(item))
+        return flattened
+    if isinstance(value, dict):
+        flattened: list[float] = []
+        for key in sorted(value):
+            flattened.extend(_flatten_numeric_structure(value[key]))
+        return flattened
+    return []
+
+
+def _read_context_metadata(meta_path: str) -> list[float]:
+    try:
+        extension = os.path.splitext(meta_path)[1].lower()
+        if extension == ".json":
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return _flatten_numeric_structure(payload)
+        if extension == ".npz":
+            data = np.load(meta_path)
+            flattened: list[float] = []
+            for key in sorted(data.files):
+                flattened.extend(_flatten_numeric_structure(data[key]))
+            return flattened
+        array = np.load(meta_path, allow_pickle=False)
+        return _flatten_numeric_structure(array)
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # pragma: no cover - best effort logging
+        print(f"⚠️ Could not parse context metadata from {meta_path}: {exc}")
+        return []
+
+
+def get_context_features(image_path: str) -> Optional[torch.Tensor]:
+    if not Config.CONTEXT_METADATA_ENABLED:
+        return None
+
+    vector_length = max(int(Config.CONTEXT_VECTOR_SIZE), 0)
+    if vector_length == 0:
+        return None
+
+    meta_path = _context_metadata_path(image_path)
+    values = _read_context_metadata(meta_path)
+
+    if not values:
+        if Config.CONTEXT_DEFAULT_FILL_VALUE == 0.0:
+            return torch.zeros(vector_length, dtype=torch.float32)
+        fill = float(Config.CONTEXT_DEFAULT_FILL_VALUE)
+        return torch.full((vector_length,), fill, dtype=torch.float32)
+
+    truncated = values[:vector_length]
+    context_tensor = torch.zeros(vector_length, dtype=torch.float32)
+    context_tensor[: len(truncated)] = torch.tensor(truncated, dtype=torch.float32)
+    return context_tensor
+
+
 class FootballDataset(Dataset):
     """Dataset that returns an augmented frame and the hidden-ball coordinates."""
 
@@ -342,7 +424,9 @@ class FootballDataset(Dataset):
         normalised = keypoint / image_extent
         normalised = normalised.clamp(0.0, 1.0)
 
-        return tensor_image, normalised, img_path
+        context_tensor = get_context_features(img_path)
+
+        return tensor_image, normalised, context_tensor, img_path
 
 
 # ======================================================================================
@@ -398,16 +482,33 @@ class CoordinateRegressionModel(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.gem_pool = GeM()
+
+        self.context_dim = 0
+        self.context_hidden_dim = 0
+        self.context_encoder: Optional[nn.Module] = None
+        if Config.USE_CONTEXT_BRANCH and Config.CONTEXT_VECTOR_SIZE > 0:
+            self.context_dim = int(Config.CONTEXT_VECTOR_SIZE)
+            self.context_hidden_dim = int(Config.CONTEXT_HIDDEN_DIM)
+            self.context_encoder = nn.Sequential(
+                nn.LayerNorm(self.context_dim),
+                nn.Linear(self.context_dim, self.context_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(Config.HEAD_DROPOUT),
+            )
+
+        head_input_dim = feature_dim * 3 + self.context_hidden_dim
         self.head = nn.Sequential(
-            nn.LayerNorm(feature_dim * 3),
+            nn.LayerNorm(head_input_dim),
             nn.Dropout(Config.HEAD_DROPOUT),
-            nn.Linear(feature_dim * 3, hidden_dim),
+            nn.Linear(head_input_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(Config.HEAD_DROPOUT),
             nn.Linear(hidden_dim, 4),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, context: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone.forward_features(x)
         if features.dim() == 3:
             # Some transformer-style backbones return (B, N, C). Reshape back to
@@ -442,7 +543,41 @@ class CoordinateRegressionModel(nn.Module):
         maxv = self.max_pool(features)
         gem = self.gem_pool(features)
         pooled = torch.cat([avg, maxv, gem], dim=1).flatten(1)
-        output = self.head(pooled)
+
+        fused = pooled
+        if self.context_encoder is not None:
+            batch_size = pooled.size(0)
+            if context is None:
+                fill = float(Config.CONTEXT_DEFAULT_FILL_VALUE)
+                context = torch.full(
+                    (batch_size, self.context_dim),
+                    fill,
+                    device=pooled.device,
+                    dtype=pooled.dtype,
+                )
+            else:
+                if context.dim() == 1:
+                    context = context.unsqueeze(0)
+                if context.size(0) != batch_size:
+                    raise ValueError(
+                        "Context tensor batch dimension does not match images"
+                    )
+                if context.size(-1) > self.context_dim:
+                    context = context[:, : self.context_dim]
+                elif context.size(-1) < self.context_dim:
+                    pad = torch.full(
+                        (batch_size, self.context_dim - context.size(-1)),
+                        float(Config.CONTEXT_DEFAULT_FILL_VALUE),
+                        device=context.device,
+                        dtype=context.dtype,
+                    )
+                    context = torch.cat([context, pad], dim=-1)
+                context = context.to(device=pooled.device, dtype=pooled.dtype)
+
+            context_emb = self.context_encoder(context)
+            fused = torch.cat([pooled, context_emb], dim=1)
+
+        output = self.head(fused)
         coords = torch.sigmoid(output[:, :2])
         if Config.USE_UNCERTAINTY:
             log_uncertainty = output[:, 2:]
@@ -797,16 +932,23 @@ def train_one_epoch(
     progress = tqdm(loader, desc=f"Train {epoch+1}", colour="green")
     accumulation = 0
 
-    for images, targets, _ in progress:
+    for batch in progress:
+        if len(batch) == 4:
+            images, targets, context, _ = batch
+        else:
+            images, targets, _ = batch
+            context = None
         images = images.to(Config.DEVICE, non_blocking=True)
         targets = targets.to(Config.DEVICE, non_blocking=True)
+        if context is not None:
+            context = context.to(Config.DEVICE, non_blocking=True)
         if mixup_fn is not None:
             images, targets = mixup_fn(images, targets)
         if Config.USE_CHANNELS_LAST:
             images = images.to(memory_format=torch.channels_last)
 
         with autocast(device_type="cuda" if Config.DEVICE.startswith("cuda") else "cpu", enabled=Config.AMP):
-            coords, uncertainty = model(images)
+            coords, uncertainty = model(images, context)
             loss, coord_loss, pixel_mae = criterion((coords, uncertainty), targets)
 
         scaled_loss = loss / Config.GRAD_ACCUM_STEPS
@@ -868,14 +1010,21 @@ def validate(
     )
 
     with torch.no_grad():
-        for images, targets, paths in progress:
+        for batch in progress:
+            if len(batch) == 4:
+                images, targets, context, paths = batch
+            else:
+                images, targets, paths = batch
+                context = None
             images = images.to(Config.DEVICE, non_blocking=True)
             targets = targets.to(Config.DEVICE, non_blocking=True)
+            if context is not None:
+                context = context.to(Config.DEVICE, non_blocking=True)
             if Config.USE_CHANNELS_LAST:
                 images = images.to(memory_format=torch.channels_last)
 
             with autocast(device_type="cuda" if Config.DEVICE.startswith("cuda") else "cpu", enabled=Config.AMP):
-                coords, uncertainty = model(images)
+                coords, uncertainty = model(images, context)
                 loss, coord_loss, pixel_mae = criterion((coords, uncertainty), targets)
 
             total_loss += loss.item()
@@ -956,13 +1105,20 @@ def save_sample_predictions(
 ) -> str:
     model.eval()
     iterator = iter(loader)
-    images, targets, paths = next(iterator)
+    batch = next(iterator)
+    if len(batch) == 4:
+        images, targets, context, paths = batch
+    else:
+        images, targets, paths = batch
+        context = None
     images = images.to(Config.DEVICE)
+    if context is not None:
+        context = context.to(Config.DEVICE)
     if Config.USE_CHANNELS_LAST:
         images = images.to(memory_format=torch.channels_last)
 
     with torch.no_grad():
-        preds, uncertainties = model(images)
+        preds, uncertainties = model(images, context)
 
     preds = preds.cpu()
     uncertainties = uncertainties.cpu()
