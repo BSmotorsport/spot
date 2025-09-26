@@ -967,13 +967,13 @@ def save_sample_predictions(
     preds = preds.cpu()
     uncertainties = uncertainties.cpu()
     targets = targets.cpu()
-    scale = torch.tensor(
+    original_scale = torch.tensor(
         [
             max(float(Config.ORIGINAL_WIDTH - 1), 1.0),
             max(float(Config.ORIGINAL_HEIGHT - 1), 1.0),
         ],
         dtype=torch.float32,
-    )
+    ).to(dtype=targets.dtype)
     count = min(max_samples, images.size(0))
 
     fig, axes = plt.subplots(count, 1, figsize=(6, 4 * count))
@@ -989,17 +989,29 @@ def save_sample_predictions(
         img_np = img.permute(1, 2, 0).numpy()
         img_np = np.clip(img_np, 0.0, 1.0)
 
+        display_scale = torch.tensor(
+            [
+                max(float(img_np.shape[1] - 1), 1.0),
+                max(float(img_np.shape[0] - 1), 1.0),
+            ],
+            dtype=torch.float32,
+        ).to(dtype=targets.dtype)
+
         ax = axes[idx]
         ax.imshow(img_np)
 
-        tgt = targets[idx] * scale
-        prd = preds[idx] * scale
+        tgt_display = targets[idx] * display_scale
+        prd_display = preds[idx] * display_scale
+        tgt = targets[idx] * original_scale
+        prd = preds[idx] * original_scale
         unc = uncertainties[idx]
-        sigma = torch.sqrt(unc.clamp(min=1e-6)) * scale
+        sigma = torch.sqrt(unc.clamp(min=1e-6)) * original_scale
         pixel_error = float(math.dist(prd.tolist(), tgt.tolist()))
 
-        ax.scatter([tgt[0]], [tgt[1]], c="lime", marker="o", label="target")
-        ax.scatter([prd[0]], [prd[1]], c="red", marker="x", label="pred")
+        ax.scatter([tgt_display[0]], [tgt_display[1]], c="lime", marker="o", label="target")
+        ax.scatter([prd_display[0]], [prd_display[1]], c="red", marker="x", label="pred")
+        ax.set_xlim(0.0, float(display_scale[0].item()))
+        ax.set_ylim(float(display_scale[1].item()), 0.0)
         filename = os.path.basename(paths[idx])
         ax.set_title(f"{filename} | Δpx: {pixel_error:.2f}")
         ax.axis("off")
