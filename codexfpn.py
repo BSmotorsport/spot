@@ -312,6 +312,30 @@ def _read_context_metadata(meta_path: str) -> list[float]:
 
 
 def get_context_features(image_path: str) -> Optional[torch.Tensor]:
+    """Load optional auxiliary cues that accompany ``image_path``.
+
+    The context branch is data-driven: :func:`get_context_features` searches
+    for a sidecar file with the suffix defined by
+    :pyattr:`Config.CONTEXT_METADATA_SUFFIX` (``.context.json`` by default).
+    These files are only read when :pyattr:`Config.CONTEXT_METADATA_ENABLED`
+    evaluates to ``True``.
+
+    Sidecars may be JSON, ``.npz`` archives, or NumPy arrays. Their numeric
+    contents are flattened and then truncated or padded to
+    :pyattr:`Config.CONTEXT_VECTOR_SIZE` before being converted into a tensor.
+    Missing files default to zeros (or the configured fill value).
+
+    To feed this information into the model, enable both
+    :pyattr:`Config.CONTEXT_METADATA_ENABLED` and
+    :pyattr:`Config.USE_CONTEXT_BRANCH`. Doing so instantiates the MLP encoder
+    that fuses the context vector with pooled image features before the
+    regression head.
+
+    Because the repository does not bundle a generator for these cues, you must
+    create the sidecar files yourself (for example using pre-computed player
+    detections, pose keypoints, or other auxiliary signals) and store them in
+    the expected numeric format.
+    """
     if not Config.CONTEXT_METADATA_ENABLED:
         return None
 
