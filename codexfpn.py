@@ -337,11 +337,14 @@ def get_context_features(image_path: str) -> Optional[torch.Tensor]:
     the expected numeric format.
     """
     if not Config.CONTEXT_METADATA_ENABLED:
-        return None
+        # The dataloader's default collate function cannot handle ``None``
+        # entries inside a batch.  Returning a zero-length tensor keeps the
+        # signature consistent without enabling the context branch.
+        return torch.zeros(0, dtype=torch.float32)
 
     vector_length = max(int(Config.CONTEXT_VECTOR_SIZE), 0)
     if vector_length == 0:
-        return None
+        return torch.zeros(0, dtype=torch.float32)
 
     meta_path = _context_metadata_path(image_path)
     values = _read_context_metadata(meta_path)
