@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import random
@@ -517,11 +518,23 @@ class CoordinateLoss(nn.Module):
             coord_term = smooth_mean
 
         image_extent = max(float(Config.image_size() - 1), 1.0)
-        pixel_errors = torch.abs(coords - target) * image_extent
-        pixel_mae = pixel_errors.mean()
+        extent_tensor = coords.new_tensor([
+            max(float(Config.ORIGINAL_WIDTH - 1), 1.0),
+            max(float(Config.ORIGINAL_HEIGHT - 1), 1.0),
+        ])
 
-        loss = coord_term + self.pixel_weight * (pixel_mae / image_extent)
-        return loss, smooth_mean.detach(), pixel_mae.detach()
+        pixel_errors_original = torch.abs(coords - target) * extent_tensor
+        pixel_mae_original = pixel_errors_original.mean()
+
+        pixel_errors_resized = torch.abs(coords - target) * image_extent
+        pixel_mae_resized = pixel_errors_resized.mean()
+
+        loss = coord_term + self.pixel_weight * (pixel_mae_resized / image_extent)
+        return (
+            loss,
+            smooth_mean.detach(),
+            pixel_mae_original.detach(),
+        )
 
 
 # ======================================================================================
@@ -700,11 +713,16 @@ def create_mixup_cutmix_fn() -> Optional[Callable[[torch.Tensor, torch.Tensor], 
 
 
 def compute_pixel_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
-    image_extent = max(float(Config.image_size() - 1), 1.0)
+    scale = pred.new_tensor(
+        [
+            max(float(Config.ORIGINAL_WIDTH - 1), 1.0),
+            max(float(Config.ORIGINAL_HEIGHT - 1), 1.0),
+        ]
+    )
     diff = (pred - target).detach()
-    errors = torch.abs(diff) * image_extent
-    mae = errors.mean().item()
-    rmse = torch.sqrt(((diff * image_extent) ** 2).mean()).item()
+    scaled_diff = diff * scale
+    mae = scaled_diff.abs().mean().item()
+    rmse = torch.sqrt((scaled_diff ** 2).mean()).item()
     return mae, rmse
 
 
@@ -724,6 +742,39 @@ def compute_percentile_errors(
 
     array = values.cpu().numpy()
     return {f"p{int(p)}": float(np.percentile(array, p)) for p in percentiles}
+
+
+def save_validation_csv(
+    rows: Sequence[Dict[str, Union[str, float, int]]],
+    epoch: int,
+    output_dir: str,
+) -> Optional[str]:
+    if not rows:
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"val_pixel_errors_epoch_{epoch + 1:03d}.csv"
+    path = os.path.join(output_dir, filename)
+
+    fieldnames = [
+        "epoch",
+        "image_path",
+        "target_x",
+        "target_y",
+        "pred_x",
+        "pred_y",
+        "error_x",
+        "error_y",
+        "error_euclidean",
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    return path
 
 
 def train_one_epoch(
@@ -795,19 +846,29 @@ def validate(
     loader: DataLoader,
     criterion: CoordinateLoss,
     epoch: int,
-) -> Tuple[float, float, float, Dict[str, float]]:
+    csv_dir: Optional[str] = None,
+) -> Tuple[float, float, float, Dict[str, float], Optional[str]]:
     model.eval()
     total_loss = 0.0
     total_coord = 0.0
     total_pixel = 0.0
     pixel_errors: list[float] = []
+    csv_rows: list[Dict[str, Union[str, float, int]]] = []
 
     progress = tqdm(loader, desc=f"Val {epoch+1}", colour="yellow")
 
     all_preds: list[torch.Tensor] = []
 
+    base_scale = torch.tensor(
+        [
+            max(float(Config.ORIGINAL_WIDTH - 1), 1.0),
+            max(float(Config.ORIGINAL_HEIGHT - 1), 1.0),
+        ],
+        device=Config.DEVICE,
+    )
+
     with torch.no_grad():
-        for images, targets, _ in progress:
+        for images, targets, paths in progress:
             images = images.to(Config.DEVICE, non_blocking=True)
             targets = targets.to(Config.DEVICE, non_blocking=True)
             if Config.USE_CHANNELS_LAST:
@@ -823,11 +884,34 @@ def validate(
 
             all_preds.append(coords.detach().cpu())
 
-            image_extent = max(float(Config.image_size() - 1), 1.0)
-            batch_errors = torch.linalg.vector_norm((coords - targets) * image_extent, dim=-1)
+            scale = base_scale.to(device=coords.device, dtype=coords.dtype)
+            diff = coords - targets
+            scaled_diff = diff * scale
+            batch_errors = torch.linalg.vector_norm(scaled_diff, dim=-1)
             if batch_errors.ndim == 0:
                 batch_errors = batch_errors.unsqueeze(0)
             pixel_errors.extend(batch_errors.detach().cpu().tolist())
+
+            if csv_dir is not None:
+                preds_original = (coords * scale).detach().cpu()
+                targets_original = (targets * scale).detach().cpu()
+                per_axis_errors = scaled_diff.abs().detach().cpu()
+                euclidean_errors = batch_errors.detach().cpu()
+
+                for idx, path in enumerate(paths):
+                    csv_rows.append(
+                        {
+                            "epoch": epoch + 1,
+                            "image_path": path,
+                            "target_x": float(targets_original[idx, 0]),
+                            "target_y": float(targets_original[idx, 1]),
+                            "pred_x": float(preds_original[idx, 0]),
+                            "pred_y": float(preds_original[idx, 1]),
+                            "error_x": float(per_axis_errors[idx, 0]),
+                            "error_y": float(per_axis_errors[idx, 1]),
+                            "error_euclidean": float(euclidean_errors[idx]),
+                        }
+                    )
 
             percentiles = compute_percentile_errors(pixel_errors)
             progress.set_postfix(
@@ -844,6 +928,10 @@ def validate(
     avg_pixel = total_pixel / batches
     percentile_metrics = compute_percentile_errors(pixel_errors)
 
+    csv_path = None
+    if csv_dir is not None:
+        csv_path = save_validation_csv(csv_rows, epoch, csv_dir)
+
     if all_preds:
         stacked = torch.cat(all_preds, dim=0)
         pred_mean = stacked.mean(dim=0)
@@ -855,7 +943,7 @@ def validate(
         if float(pred_std.mean()) < 0.05:
             print("⚠️ Warning: Predictions may have collapsed to a single point")
 
-    return avg_loss, avg_coord, avg_pixel, percentile_metrics
+    return avg_loss, avg_coord, avg_pixel, percentile_metrics, csv_path
 
 
 def save_sample_predictions(
@@ -879,7 +967,13 @@ def save_sample_predictions(
     preds = preds.cpu()
     uncertainties = uncertainties.cpu()
     targets = targets.cpu()
-    image_extent = float(Config.image_size() - 1)
+    scale = torch.tensor(
+        [
+            max(float(Config.ORIGINAL_WIDTH - 1), 1.0),
+            max(float(Config.ORIGINAL_HEIGHT - 1), 1.0),
+        ],
+        dtype=torch.float32,
+    )
     count = min(max_samples, images.size(0))
 
     fig, axes = plt.subplots(count, 1, figsize=(6, 4 * count))
@@ -898,10 +992,10 @@ def save_sample_predictions(
         ax = axes[idx]
         ax.imshow(img_np)
 
-        tgt = targets[idx] * image_extent
-        prd = preds[idx] * image_extent
+        tgt = targets[idx] * scale
+        prd = preds[idx] * scale
         unc = uncertainties[idx]
-        sigma = torch.sqrt(unc.clamp(min=1e-6)) * image_extent
+        sigma = torch.sqrt(unc.clamp(min=1e-6)) * scale
         pixel_error = float(math.dist(prd.tolist(), tgt.tolist()))
 
         ax.scatter([tgt[0]], [tgt[1]], c="lime", marker="o", label="target")
@@ -1312,8 +1406,18 @@ def main() -> None:
         val_results: Optional[dict] = None
 
         if (epoch + 1) % Config.VALIDATE_EVERY == 0:
-            val_loss, val_coord, val_pixel, val_percentiles = validate(
-                model, val_loader, criterion, epoch
+            (
+                val_loss,
+                val_coord,
+                val_pixel,
+                val_percentiles,
+                csv_path,
+            ) = validate(
+                model,
+                val_loader,
+                criterion,
+                epoch,
+                csv_dir=Config.OUTPUT_DIR,
             )
             history.setdefault("train", []).append(train_loss)
             history.setdefault("val", []).append(val_loss)
@@ -1361,6 +1465,8 @@ def main() -> None:
                 metrics=metrics_payload,
             )
             print(f"Validation samples saved to {sample_path}")
+            if csv_path:
+                print(f"Validation metrics CSV saved to {csv_path}")
 
         else:
             history.setdefault("train", []).append(train_loss)
