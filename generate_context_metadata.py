@@ -32,6 +32,11 @@ def _config_value(name: str, default):
     return getattr(Config, name, default)
 
 
+CONTEXT_METADATA_SUFFIX = _config_value("CONTEXT_METADATA_SUFFIX", ".context.json")
+CONTEXT_VECTOR_SIZE = _config_value("CONTEXT_VECTOR_SIZE", 128)
+CONTEXT_DEFAULT_FILL_VALUE = _config_value("CONTEXT_DEFAULT_FILL_VALUE", 0.0)
+
+
 IMAGE_EXTENSIONS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 
@@ -147,19 +152,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suffix",
-        default=_config_value("CONTEXT_METADATA_SUFFIX", ".context.json"),
+        default=CONTEXT_METADATA_SUFFIX,
         help="Filename suffix used for the generated sidecar files.",
     )
     parser.add_argument(
         "--vector-size",
         type=int,
-        default=_config_value("CONTEXT_VECTOR_SIZE", 128),
+        default=CONTEXT_VECTOR_SIZE,
         help="Length of the context vector expected by the model.",
     )
     parser.add_argument(
         "--fill-value",
         type=float,
-        default=_config_value("CONTEXT_DEFAULT_FILL_VALUE", 0.0),
+        default=CONTEXT_DEFAULT_FILL_VALUE,
         help="Pad shorter vectors with this value.",
     )
     parser.add_argument(
