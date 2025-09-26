@@ -19,6 +19,19 @@ import numpy as np
 from codexfpn import Config
 
 
+def _config_value(name: str, default):
+    """Return ``Config.<name>`` if available, otherwise ``default``.
+
+    The training configuration historically shipped without the context-specific
+    attributes used by this utility.  Older checkpoints therefore lack
+    ``CONTEXT_METADATA_SUFFIX`` and companions which breaks standalone
+    invocation of the script.  Using ``getattr`` keeps the defaults in this
+    module while still honouring project overrides when present.
+    """
+
+    return getattr(Config, name, default)
+
+
 IMAGE_EXTENSIONS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 
@@ -134,19 +147,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suffix",
-        default=Config.CONTEXT_METADATA_SUFFIX,
+        default=_config_value("CONTEXT_METADATA_SUFFIX", ".context.json"),
         help="Filename suffix used for the generated sidecar files.",
     )
     parser.add_argument(
         "--vector-size",
         type=int,
-        default=Config.CONTEXT_VECTOR_SIZE,
+        default=_config_value("CONTEXT_VECTOR_SIZE", 128),
         help="Length of the context vector expected by the model.",
     )
     parser.add_argument(
         "--fill-value",
         type=float,
-        default=Config.CONTEXT_DEFAULT_FILL_VALUE,
+        default=_config_value("CONTEXT_DEFAULT_FILL_VALUE", 0.0),
         help="Pad shorter vectors with this value.",
     )
     parser.add_argument(
