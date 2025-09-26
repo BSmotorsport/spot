@@ -43,10 +43,11 @@ def test_rotated_sample_targets_stay_in_range(tmp_path):
         transform=transform,
     )
 
-    image_tensor, precise_coords, path = dataset[0]
+    image_tensor, precise_coords, context, path = dataset[0]
 
     assert image_tensor.shape == (3, Config.IMAGE_SIZE, Config.IMAGE_SIZE)
     assert precise_coords.shape == (2,)
+    assert context is None
     assert path.endswith(".jpg")
 
     assert torch.all(precise_coords >= 0.0)
@@ -57,6 +58,7 @@ def test_rotated_sample_targets_stay_in_range(tmp_path):
     assert torch.all(image_coords <= Config.IMAGE_SIZE - 1)
 
     # The second sample should fall back to the first if its keypoint is dropped
-    image_tensor_2, precise_coords_2, _ = dataset[1]
+    image_tensor_2, precise_coords_2, context_2, _ = dataset[1]
     assert torch.allclose(image_tensor, image_tensor_2)
     assert torch.allclose(precise_coords, precise_coords_2)
+    assert context_2 is None
