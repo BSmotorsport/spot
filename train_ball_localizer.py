@@ -76,6 +76,10 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     gradient_clip_norm: float | None = 1.0
 
+    # Loss weighting
+    heatmap_fg_weight: float = 1.0
+    heatmap_bg_weight: float = 1.0
+
     # Data loading
     num_workers: int = 6
     val_fraction: float = 0.2
@@ -87,8 +91,8 @@ class TrainingConfig:
 
     # Training utilities
     log_every: int = 50
-    checkpoint_interval: int = 1
     amp: bool = torch.cuda.is_available()
+    resume_from: Path | None = None
 
     def device(self) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -367,6 +371,8 @@ def save_checkpoint(
     config: TrainingConfig,
     scaler: GradScaler | None,
     metrics: dict[str, float],
+    best_val_loss: float,
+    is_best: bool,
 ) -> None:
     checkpoint_dir = config.output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -376,12 +382,59 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "config": dataclasses.asdict(config),
         "metrics": metrics,
+        "loss_weights": {
+            "heatmap_fg_weight": config.heatmap_fg_weight,
+            "heatmap_bg_weight": config.heatmap_bg_weight,
+        },
+        "best_val_loss": best_val_loss,
     }
     if scaler is not None:
         state["scaler_state"] = scaler.state_dict()
 
-    checkpoint_path = checkpoint_dir / f"epoch_{epoch:04d}.pth"
-    torch.save(state, checkpoint_path)
+    last_path = checkpoint_dir / "last.pth"
+    torch.save(state, last_path)
+
+    if is_best:
+        best_path = checkpoint_dir / "best.pth"
+        torch.save(state, best_path)
+
+
+def resolve_resume_checkpoint(config: TrainingConfig) -> Path | None:
+    if config.resume_from is not None:
+        return config.resume_from
+
+    default_path = config.output_dir / "checkpoints" / "last.pth"
+    if default_path.exists():
+        return default_path
+    return None
+
+
+def resume_from_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler | None,
+    config: TrainingConfig,
+) -> tuple[int, float]:
+    checkpoint_path = resolve_resume_checkpoint(config)
+    if checkpoint_path is None:
+        return 1, float("inf")
+
+    print(f"Resuming from checkpoint: {checkpoint_path}")
+    state = torch.load(checkpoint_path, map_location="cpu")
+
+    model.load_state_dict(state["model_state"])
+    optimizer.load_state_dict(state["optimizer_state"])
+
+    if scaler is not None and "scaler_state" in state:
+        scaler.load_state_dict(state["scaler_state"])
+
+    start_epoch = int(state.get("epoch", 0)) + 1
+    best_val_loss = float(state.get("best_val_loss", float("inf")))
+    if not np.isfinite(best_val_loss):
+        metrics = state.get("metrics", {})
+        best_val_loss = float(metrics.get("val_loss", float("inf")))
+
+    return max(start_epoch, 1), best_val_loss
 
 
 def create_dataloaders(
@@ -444,9 +497,9 @@ def train_one_epoch(
 ) -> dict[str, float]:
     model.train()
     loss_meter = 0.0
-    total = 0
+    weight_meter = 0.0
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}")
     device = config.device()
     autocast_device_type = device.type
@@ -459,7 +512,14 @@ def train_one_epoch(
 
         with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
-            loss = criterion(outputs, targets)
+            loss_map = criterion(outputs, targets)
+            weights = (
+                targets * config.heatmap_fg_weight
+                + (1.0 - targets) * config.heatmap_bg_weight
+            )
+            weighted_loss = loss_map * weights
+            weight_sum = weights.sum()
+            loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
 
         if scaler is not None and config.amp:
             scaler.scale(loss).backward()
@@ -478,13 +538,14 @@ def train_one_epoch(
                 )
             optimizer.step()
 
-        loss_meter += loss.item() * images.size(0)
-        total += images.size(0)
+        loss_meter += weighted_loss.sum().detach().item()
+        weight_meter += weight_sum.detach().item()
 
         if step % config.log_every == 0:
-            progress.set_postfix({"loss": loss_meter / max(total, 1)})
+            avg_loss = loss_meter / max(weight_meter, 1e-12)
+            progress.set_postfix({"loss": avg_loss})
 
-    avg_loss = loss_meter / max(total, 1)
+    avg_loss = loss_meter / max(weight_meter, 1e-12)
     return {"loss": avg_loss}
 
 
@@ -495,10 +556,10 @@ def validate(
     config: TrainingConfig,
 ) -> dict[str, float]:
     model.eval()
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
 
     loss_meter = 0.0
-    total = 0
+    weight_meter = 0.0
     pixel_errors: List[float] = []
     device = config.device()
 
@@ -507,15 +568,22 @@ def validate(
         targets = batch["heatmap"].to(device)
 
         outputs = model(images)
-        loss = criterion(outputs, targets)
+        loss_map = criterion(outputs, targets)
+        weights = (
+            targets * config.heatmap_fg_weight
+            + (1.0 - targets) * config.heatmap_bg_weight
+        )
+        weighted_loss = loss_map * weights
+        weight_sum = weights.sum()
+        loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.append(metrics["pixel_mae"])
 
-        loss_meter += loss.item() * images.size(0)
-        total += images.size(0)
+        loss_meter += weighted_loss.sum().item()
+        weight_meter += weight_sum.item()
 
-    avg_loss = loss_meter / max(total, 1)
+    avg_loss = loss_meter / max(weight_meter, 1e-12)
     avg_pixel_error = float(np.mean(pixel_errors)) if pixel_errors else float("nan")
     return {"val_loss": avg_loss, "val_pixel_mae": avg_pixel_error}
 
@@ -549,6 +617,24 @@ def parse_args() -> TrainingConfig:
         help="Validation fraction (grouped by scene)",
     )
     parser.add_argument(
+        "--heatmap-fg-weight",
+        type=float,
+        default=None,
+        help="Foreground weight for the heatmap loss",
+    )
+    parser.add_argument(
+        "--heatmap-bg-weight",
+        type=float,
+        default=None,
+        help="Background weight for the heatmap loss",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Path to a checkpoint to resume training from",
+    )
+    parser.add_argument(
         "--config-dump",
         action="store_true",
         help="Print resolved configuration and exit",
@@ -569,6 +655,12 @@ def parse_args() -> TrainingConfig:
         config.backbone_name = args.backbone
     if args.val_fraction is not None:
         config.val_fraction = args.val_fraction
+    if args.heatmap_fg_weight is not None:
+        config.heatmap_fg_weight = args.heatmap_fg_weight
+    if args.heatmap_bg_weight is not None:
+        config.heatmap_bg_weight = args.heatmap_bg_weight
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
 
     if args.config_dump:
         print(json.dumps(dataclasses.asdict(config), indent=2, default=str))
@@ -604,15 +696,38 @@ def main() -> None:  # pragma: no cover - CLI entry point
     )
     scaler = GradScaler(enabled=config.amp)
 
-    history: list[dict[str, float]] = []
+    history_path = config.output_dir / "training_history.json"
+    if history_path.exists():
+        with history_path.open("r", encoding="utf-8") as f:
+            history: list[dict[str, float]] = json.load(f)
+    else:
+        history = []
 
-    for epoch in range(1, config.num_epochs + 1):
+    history_best_candidates = [
+        float(entry.get("val_loss", float("inf"))) for entry in history
+    ]
+    best_val_loss = min(history_best_candidates, default=float("inf"))
+
+    start_epoch, checkpoint_best = resume_from_checkpoint(
+        model, optimizer, scaler, config
+    )
+    if np.isfinite(checkpoint_best):
+        best_val_loss = min(best_val_loss, checkpoint_best)
+
+    if start_epoch > 1:
+        history = [
+            entry for entry in history if int(entry.get("epoch", 0)) < start_epoch
+        ]
+
+    for epoch in range(start_epoch, config.num_epochs + 1):
         train_metrics = train_one_epoch(
             model, optimizer, train_loader, scaler, config, epoch
         )
         val_metrics = validate(model, val_loader, config)
 
         combined = {**train_metrics, **val_metrics, "epoch": epoch}
+        combined["heatmap_fg_weight"] = config.heatmap_fg_weight
+        combined["heatmap_bg_weight"] = config.heatmap_bg_weight
         history.append(combined)
 
         print(
@@ -622,10 +737,22 @@ def main() -> None:  # pragma: no cover - CLI entry point
             f"val_pixel_mae={val_metrics['val_pixel_mae']:.2f}"
         )
 
-        if epoch % config.checkpoint_interval == 0:
-            save_checkpoint(model, optimizer, epoch, config, scaler, val_metrics)
+        current_val_loss = float(val_metrics.get("val_loss", float("inf")))
+        is_best = current_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = current_val_loss
 
-    history_path = config.output_dir / "training_history.json"
+        save_checkpoint(
+            model,
+            optimizer,
+            epoch,
+            config,
+            scaler,
+            val_metrics,
+            best_val_loss,
+            is_best,
+        )
+
     with history_path.open("w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
