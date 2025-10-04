@@ -420,7 +420,7 @@ def resume_from_checkpoint(
         return 1, float("inf")
 
     print(f"Resuming from checkpoint: {checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location="cpu")
+    state = torch.load(checkpoint_path, map_location=config.device())
 
     model.load_state_dict(state["model_state"])
     optimizer.load_state_dict(state["optimizer_state"])
