@@ -120,11 +120,25 @@ class ImageRecord:
     prefix: str
 
 
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+
 def discover_dataset_images(dataset_dir: Path) -> List[ImageRecord]:
     """Walk ``dataset_dir`` and parse metadata from BOTB filenames."""
 
+    if not dataset_dir.exists():
+        raise FileNotFoundError(
+            f"Dataset directory '{dataset_dir}' does not exist."
+        )
+    if not dataset_dir.is_dir():
+        raise NotADirectoryError(
+            f"Dataset path '{dataset_dir}' is not a directory."
+        )
+
     records: List[ImageRecord] = []
-    for path in sorted(dataset_dir.rglob("*.jpg")):
+    for path in sorted(dataset_dir.rglob("*")):
+        if path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            continue
         match = FILENAME_PATTERN.search(path.stem)
         if match is None:
             raise ValueError(
@@ -138,7 +152,8 @@ def discover_dataset_images(dataset_dir: Path) -> List[ImageRecord]:
 
     if not records:
         raise RuntimeError(
-            f"No .jpg images were discovered under '{dataset_dir}'. Check the path."
+            "No supported images were discovered under "
+            f"'{dataset_dir}'. Check the path and file extensions."
         )
 
     return records
@@ -359,6 +374,7 @@ def compute_metrics(
         metrics = {
             "pixel_mae": error.mean().item(),
             "pixel_median": error.median().item(),
+            "pixel_errors": error.detach().cpu().tolist(),
         }
 
         return metrics
@@ -468,12 +484,14 @@ def create_dataloaders(
         color_transform=None,
     )
 
+    pin_memory = torch.cuda.is_available()
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -481,7 +499,7 @@ def create_dataloaders(
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=False,
     )
     return train_loader, val_loader
@@ -578,7 +596,7 @@ def validate(
         loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
 
         metrics = compute_metrics(outputs, batch, config)
-        pixel_errors.append(metrics["pixel_mae"])
+        pixel_errors.extend(metrics.get("pixel_errors", []))
 
         loss_meter += weighted_loss.sum().item()
         weight_meter += weight_sum.item()
@@ -594,6 +612,28 @@ def setup_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        if torch.backends.cudnn.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+
+def validate_config(config: TrainingConfig) -> None:
+    if config.input_size <= 0:
+        raise ValueError("input_size must be positive")
+    if config.heatmap_size <= 0:
+        raise ValueError("heatmap_size must be positive")
+    if config.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if config.learning_rate <= 0:
+        raise ValueError("learning_rate must be positive")
+    if not 0.0 < config.val_fraction < 1.0:
+        raise ValueError("val_fraction must be within (0, 1)")
+    if config.heatmap_size > config.input_size:
+        raise ValueError("heatmap_size cannot exceed input_size")
+    if config.output_dir.exists() and not config.output_dir.is_dir():
+        raise NotADirectoryError(
+            f"Output path '{config.output_dir}' exists but is not a directory"
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -610,6 +650,8 @@ def parse_args() -> TrainingConfig:
     parser.add_argument(
         "--backbone", type=str, default=None, help="timm backbone name"
     )
+    parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer learning rate")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Optimizer weight decay")
     parser.add_argument(
         "--val-fraction",
         type=float,
@@ -628,11 +670,21 @@ def parse_args() -> TrainingConfig:
         default=None,
         help="Background weight for the heatmap loss",
     )
+    parser.add_argument("--num-workers", type=int, default=None, help="Number of data loader workers")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--input-size", type=int, default=None, help="Square input resolution")
+    parser.add_argument("--heatmap-size", type=int, default=None, help="Predicted heatmap resolution")
+    parser.add_argument("--heatmap-sigma", type=float, default=None, help="Gaussian sigma used to render heatmaps")
     parser.add_argument(
         "--resume-from",
         type=Path,
         default=None,
         help="Path to a checkpoint to resume training from",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable automatic mixed precision even when CUDA is available",
     )
     parser.add_argument(
         "--config-dump",
@@ -653,14 +705,30 @@ def parse_args() -> TrainingConfig:
         config.batch_size = args.batch_size
     if args.backbone is not None:
         config.backbone_name = args.backbone
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+    if args.weight_decay is not None:
+        config.weight_decay = args.weight_decay
     if args.val_fraction is not None:
         config.val_fraction = args.val_fraction
     if args.heatmap_fg_weight is not None:
         config.heatmap_fg_weight = args.heatmap_fg_weight
     if args.heatmap_bg_weight is not None:
         config.heatmap_bg_weight = args.heatmap_bg_weight
+    if args.num_workers is not None:
+        config.num_workers = args.num_workers
+    if args.seed is not None:
+        config.random_seed = args.seed
+    if args.input_size is not None:
+        config.input_size = args.input_size
+    if args.heatmap_size is not None:
+        config.heatmap_size = args.heatmap_size
+    if args.heatmap_sigma is not None:
+        config.heatmap_sigma = args.heatmap_sigma
     if args.resume_from is not None:
         config.resume_from = args.resume_from
+    if args.no_amp:
+        config.amp = False
 
     if args.config_dump:
         print(json.dumps(dataclasses.asdict(config), indent=2, default=str))
@@ -671,6 +739,7 @@ def parse_args() -> TrainingConfig:
 
 def main() -> None:  # pragma: no cover - CLI entry point
     config = parse_args()
+    validate_config(config)
     setup_seed(config.random_seed)
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
