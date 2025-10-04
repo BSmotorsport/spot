@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import inspect
 import json
 import random
 import re
+import pathlib
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -582,10 +584,23 @@ def resume_from_checkpoint(
         return 1, float("inf")
 
     print(f"Resuming from checkpoint: {checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location=config.device())
+    if hasattr(torch, "serialization") and hasattr(pathlib, "WindowsPath"):
+        add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+        if callable(add_safe_globals):
+            add_safe_globals([pathlib.WindowsPath])
+    load_kwargs = {"map_location": "cpu"}
+    load_signature = inspect.signature(torch.load)
+    if "weights_only" in load_signature.parameters:
+        load_kwargs["weights_only"] = False
+    state = torch.load(checkpoint_path, **load_kwargs)
 
     model.load_state_dict(state["model_state"])
     optimizer.load_state_dict(state["optimizer_state"])
+    device = config.device()
+    for value in optimizer.state.values():
+        for key, tensor in value.items():
+            if isinstance(tensor, torch.Tensor):
+                value[key] = tensor.to(device=device, non_blocking=device.type == "cuda")
 
     if scaler is not None and "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
