@@ -91,6 +91,7 @@ class TrainingConfig:
 
     # Training utilities
     log_every: int = 50
+    validation_sample_count: int = 16
     amp: bool = torch.cuda.is_available()
     resume_from: Path | None = None
 
@@ -380,6 +381,151 @@ def compute_metrics(
         return metrics
 
 
+class ValidationSampleExporter:
+    """Persist visualisations of validation predictions for debugging."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        config: TrainingConfig,
+        max_samples: int,
+    ) -> None:
+        self.max_samples = max(0, int(max_samples))
+        self.saved = 0
+        self.config = config
+        self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self._std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        self.output_dir = output_dir
+        if self.max_samples > 0:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_batch(self, batch: dict[str, torch.Tensor | list[str]], probs: torch.Tensor) -> None:
+        if self.saved >= self.max_samples or self.max_samples == 0:
+            return
+
+        images = batch["image"]
+        targets = batch["heatmap"]
+        input_xy = batch["input_xy"]
+        original_xy = batch["original_xy"]
+        pads = batch["pad"]
+        scales = batch["scale"]
+        paths = batch["path"]
+
+        batch_size = int(images.shape[0])
+        remaining = self.max_samples - self.saved
+        export_count = min(batch_size, remaining)
+
+        probs = probs.detach().cpu()
+
+        for idx in range(export_count):
+            image_tensor = images[idx]
+            image = self._denormalize_image(image_tensor)
+
+            pred_heatmap = probs[idx, 0].numpy()
+            target_heatmap = targets[idx, 0].detach().cpu().numpy()
+
+            pred_canvas_xy = self._decode_heatmap(pred_heatmap)
+            gt_canvas_xy = input_xy[idx].detach().cpu().numpy()
+            pad = pads[idx].detach().cpu().numpy()
+            scale = float(scales[idx].detach().cpu().item())
+            gt_original_xy = original_xy[idx].detach().cpu().numpy()
+            pred_original_xy = (
+                (pred_canvas_xy[0] - pad[0]) / scale,
+                (pred_canvas_xy[1] - pad[1]) / scale,
+            )
+            pixel_error = float(
+                np.linalg.norm(np.array(pred_original_xy) - gt_original_xy)
+            )
+
+            annotated = self._annotate_points(
+                image.copy(), pred_canvas_xy, gt_canvas_xy
+            )
+            pred_overlay = self._heatmap_overlay(image.copy(), pred_heatmap)
+            pred_overlay = self._annotate_points(
+                pred_overlay, pred_canvas_xy, gt_canvas_xy
+            )
+            target_overlay = self._heatmap_overlay(image.copy(), target_heatmap)
+            target_overlay = self._annotate_points(
+                target_overlay, gt_canvas_xy, gt_canvas_xy
+            )
+
+            combined = np.concatenate(
+                [annotated, pred_overlay, target_overlay], axis=1
+            )
+
+            info_text = (
+                f"pred canvas=({pred_canvas_xy[0]:.1f}, {pred_canvas_xy[1]:.1f}) "
+                f"| gt canvas=({gt_canvas_xy[0]:.1f}, {gt_canvas_xy[1]:.1f}) "
+                f"| pixel err={pixel_error:.2f}"
+            )
+            cv2.putText(
+                combined,
+                info_text,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            path_value = paths[idx]
+            if isinstance(path_value, (list, tuple)):
+                path_value = path_value[0]
+            stem = Path(path_value).stem
+            output_path = self.output_dir / f"{self.saved:03d}_{stem}.png"
+            cv2.imwrite(str(output_path), combined)
+            self.saved += 1
+
+            if self.saved >= self.max_samples:
+                break
+
+    def _denormalize_image(self, tensor: torch.Tensor) -> np.ndarray:
+        array = tensor.detach().cpu().permute(1, 2, 0).numpy()
+        array = array * self._std + self._mean
+        array = np.clip(array, 0.0, 1.0)
+        array = (array * 255.0).astype(np.uint8)
+        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+
+    def _heatmap_overlay(self, image: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
+        heatmap = np.nan_to_num(heatmap, nan=0.0)
+        max_val = float(np.max(heatmap))
+        if max_val > 1e-6:
+            normalized = heatmap / max_val
+        else:
+            normalized = heatmap
+        resized = cv2.resize(
+            normalized.astype(np.float32),
+            (image.shape[1], image.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        overlay = cv2.applyColorMap(
+            np.clip(resized * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_MAGMA
+        )
+        return cv2.addWeighted(image, 0.6, overlay, 0.4, 0)
+
+    def _annotate_points(
+        self,
+        image: np.ndarray,
+        pred_canvas_xy: tuple[float, float],
+        gt_canvas_xy: tuple[float, float],
+    ) -> np.ndarray:
+        pred_point = (int(round(pred_canvas_xy[0])), int(round(pred_canvas_xy[1])))
+        gt_point = (int(round(gt_canvas_xy[0])), int(round(gt_canvas_xy[1])))
+        cv2.circle(image, gt_point, 8, (0, 255, 0), 2)
+        cv2.circle(image, pred_point, 8, (0, 0, 255), 2)
+        return image
+
+    def _decode_heatmap(self, heatmap: np.ndarray) -> tuple[float, float]:
+        h, w = heatmap.shape
+        flat_idx = int(np.argmax(heatmap))
+        y = (flat_idx // w) + 0.5
+        x = (flat_idx % w) + 0.5
+        scale = self.config.input_size / self.config.heatmap_size
+        return x * scale, y * scale
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -572,6 +718,8 @@ def validate(
     model: nn.Module,
     dataloader: DataLoader,
     config: TrainingConfig,
+    *,
+    epoch: int | None = None,
 ) -> dict[str, float]:
     model.eval()
     criterion = nn.BCEWithLogitsLoss(reduction="none")
@@ -580,6 +728,15 @@ def validate(
     weight_meter = 0.0
     pixel_errors: List[float] = []
     device = config.device()
+
+    sample_exporter: ValidationSampleExporter | None = None
+    if config.validation_sample_count > 0:
+        export_dir = config.output_dir / "validation_samples"
+        if epoch is not None:
+            export_dir = export_dir / f"epoch_{epoch:03d}"
+        sample_exporter = ValidationSampleExporter(
+            export_dir, config, config.validation_sample_count
+        )
 
     for batch in tqdm(dataloader, desc="Validate"):
         images = batch["image"].to(device)
@@ -597,6 +754,10 @@ def validate(
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.extend(metrics.get("pixel_errors", []))
+
+        if sample_exporter is not None:
+            probs = torch.sigmoid(outputs)
+            sample_exporter.save_batch(batch, probs)
 
         loss_meter += weighted_loss.sum().item()
         weight_meter += weight_sum.item()
@@ -682,6 +843,12 @@ def parse_args() -> TrainingConfig:
         help="Path to a checkpoint to resume training from",
     )
     parser.add_argument(
+        "--val-sample-count",
+        type=int,
+        default=None,
+        help="Number of validation samples to export as visualisations",
+    )
+    parser.add_argument(
         "--no-amp",
         action="store_true",
         help="Disable automatic mixed precision even when CUDA is available",
@@ -727,6 +894,8 @@ def parse_args() -> TrainingConfig:
         config.heatmap_sigma = args.heatmap_sigma
     if args.resume_from is not None:
         config.resume_from = args.resume_from
+    if args.val_sample_count is not None:
+        config.validation_sample_count = args.val_sample_count
     if args.no_amp:
         config.amp = False
 
@@ -792,7 +961,7 @@ def main() -> None:  # pragma: no cover - CLI entry point
         train_metrics = train_one_epoch(
             model, optimizer, train_loader, scaler, config, epoch
         )
-        val_metrics = validate(model, val_loader, config)
+        val_metrics = validate(model, val_loader, config, epoch=epoch)
 
         combined = {**train_metrics, **val_metrics, "epoch": epoch}
         combined["heatmap_fg_weight"] = config.heatmap_fg_weight
