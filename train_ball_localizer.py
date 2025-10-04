@@ -37,6 +37,7 @@ import dataclasses
 import json
 import random
 import re
+import pathlib
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -582,6 +583,10 @@ def resume_from_checkpoint(
         return 1, float("inf")
 
     print(f"Resuming from checkpoint: {checkpoint_path}")
+    if hasattr(torch, "serialization") and hasattr(pathlib, "WindowsPath"):
+        add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+        if callable(add_safe_globals):
+            add_safe_globals([pathlib.WindowsPath])
     state = torch.load(checkpoint_path, map_location=config.device())
 
     model.load_state_dict(state["model_state"])
