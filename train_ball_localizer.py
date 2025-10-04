@@ -448,14 +448,16 @@ def train_one_epoch(
 
     criterion = nn.BCEWithLogitsLoss()
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}")
+    device = config.device()
+    autocast_device_type = device.type
 
     for step, batch in enumerate(progress, start=1):
-        images = batch["image"].to(config.device())
-        targets = batch["heatmap"].to(config.device())
+        images = batch["image"].to(device)
+        targets = batch["heatmap"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=config.amp):
+        with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
             loss = criterion(outputs, targets)
 
@@ -498,10 +500,11 @@ def validate(
     loss_meter = 0.0
     total = 0
     pixel_errors: List[float] = []
+    device = config.device()
 
     for batch in tqdm(dataloader, desc="Validate"):
-        images = batch["image"].to(config.device())
-        targets = batch["heatmap"].to(config.device())
+        images = batch["image"].to(device)
+        targets = batch["heatmap"].to(device)
 
         outputs = model(images)
         loss = criterion(outputs, targets)
