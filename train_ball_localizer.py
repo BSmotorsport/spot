@@ -79,7 +79,7 @@ class TrainingConfig:
     gradient_clip_norm: float | None = 1.0
 
     # Loss weighting
-    heatmap_fg_weight: float = 1.0
+    heatmap_fg_weight: float = 5.0
     heatmap_bg_weight: float = 1.0
 
     # Data loading
@@ -838,13 +838,13 @@ def parse_args() -> TrainingConfig:
         "--heatmap-fg-weight",
         type=float,
         default=None,
-        help="Foreground weight for the heatmap loss",
+        help="Foreground weight for the heatmap loss (default: 5.0)",
     )
     parser.add_argument(
         "--heatmap-bg-weight",
         type=float,
         default=None,
-        help="Background weight for the heatmap loss",
+        help="Background weight for the heatmap loss (default: 1.0)",
     )
     parser.add_argument("--num-workers", type=int, default=None, help="Number of data loader workers")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
