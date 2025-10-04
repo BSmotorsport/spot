@@ -76,6 +76,10 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     gradient_clip_norm: float | None = 1.0
 
+    # Loss weighting
+    heatmap_fg_weight: float = 1.0
+    heatmap_bg_weight: float = 1.0
+
     # Data loading
     num_workers: int = 6
     val_fraction: float = 0.2
@@ -376,6 +380,10 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "config": dataclasses.asdict(config),
         "metrics": metrics,
+        "loss_weights": {
+            "heatmap_fg_weight": config.heatmap_fg_weight,
+            "heatmap_bg_weight": config.heatmap_bg_weight,
+        },
     }
     if scaler is not None:
         state["scaler_state"] = scaler.state_dict()
@@ -444,9 +452,9 @@ def train_one_epoch(
 ) -> dict[str, float]:
     model.train()
     loss_meter = 0.0
-    total = 0
+    weight_meter = 0.0
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}")
     device = config.device()
     autocast_device_type = device.type
@@ -459,7 +467,14 @@ def train_one_epoch(
 
         with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
-            loss = criterion(outputs, targets)
+            loss_map = criterion(outputs, targets)
+            weights = (
+                targets * config.heatmap_fg_weight
+                + (1.0 - targets) * config.heatmap_bg_weight
+            )
+            weighted_loss = loss_map * weights
+            weight_sum = weights.sum()
+            loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
 
         if scaler is not None and config.amp:
             scaler.scale(loss).backward()
@@ -478,13 +493,14 @@ def train_one_epoch(
                 )
             optimizer.step()
 
-        loss_meter += loss.item() * images.size(0)
-        total += images.size(0)
+        loss_meter += weighted_loss.sum().detach().item()
+        weight_meter += weight_sum.detach().item()
 
         if step % config.log_every == 0:
-            progress.set_postfix({"loss": loss_meter / max(total, 1)})
+            avg_loss = loss_meter / max(weight_meter, 1e-12)
+            progress.set_postfix({"loss": avg_loss})
 
-    avg_loss = loss_meter / max(total, 1)
+    avg_loss = loss_meter / max(weight_meter, 1e-12)
     return {"loss": avg_loss}
 
 
@@ -495,10 +511,10 @@ def validate(
     config: TrainingConfig,
 ) -> dict[str, float]:
     model.eval()
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
 
     loss_meter = 0.0
-    total = 0
+    weight_meter = 0.0
     pixel_errors: List[float] = []
     device = config.device()
 
@@ -507,15 +523,22 @@ def validate(
         targets = batch["heatmap"].to(device)
 
         outputs = model(images)
-        loss = criterion(outputs, targets)
+        loss_map = criterion(outputs, targets)
+        weights = (
+            targets * config.heatmap_fg_weight
+            + (1.0 - targets) * config.heatmap_bg_weight
+        )
+        weighted_loss = loss_map * weights
+        weight_sum = weights.sum()
+        loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.append(metrics["pixel_mae"])
 
-        loss_meter += loss.item() * images.size(0)
-        total += images.size(0)
+        loss_meter += weighted_loss.sum().item()
+        weight_meter += weight_sum.item()
 
-    avg_loss = loss_meter / max(total, 1)
+    avg_loss = loss_meter / max(weight_meter, 1e-12)
     avg_pixel_error = float(np.mean(pixel_errors)) if pixel_errors else float("nan")
     return {"val_loss": avg_loss, "val_pixel_mae": avg_pixel_error}
 
@@ -549,6 +572,18 @@ def parse_args() -> TrainingConfig:
         help="Validation fraction (grouped by scene)",
     )
     parser.add_argument(
+        "--heatmap-fg-weight",
+        type=float,
+        default=None,
+        help="Foreground weight for the heatmap loss",
+    )
+    parser.add_argument(
+        "--heatmap-bg-weight",
+        type=float,
+        default=None,
+        help="Background weight for the heatmap loss",
+    )
+    parser.add_argument(
         "--config-dump",
         action="store_true",
         help="Print resolved configuration and exit",
@@ -569,6 +604,10 @@ def parse_args() -> TrainingConfig:
         config.backbone_name = args.backbone
     if args.val_fraction is not None:
         config.val_fraction = args.val_fraction
+    if args.heatmap_fg_weight is not None:
+        config.heatmap_fg_weight = args.heatmap_fg_weight
+    if args.heatmap_bg_weight is not None:
+        config.heatmap_bg_weight = args.heatmap_bg_weight
 
     if args.config_dump:
         print(json.dumps(dataclasses.asdict(config), indent=2, default=str))
@@ -613,6 +652,8 @@ def main() -> None:  # pragma: no cover - CLI entry point
         val_metrics = validate(model, val_loader, config)
 
         combined = {**train_metrics, **val_metrics, "epoch": epoch}
+        combined["heatmap_fg_weight"] = config.heatmap_fg_weight
+        combined["heatmap_bg_weight"] = config.heatmap_bg_weight
         history.append(combined)
 
         print(
