@@ -48,6 +48,7 @@ import numpy as np
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.model_selection import GroupShuffleSplit
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
@@ -321,21 +322,64 @@ class BotbBallDataset(Dataset):
 
 
 class HeatmapRegressor(nn.Module):
-    """A thin wrapper around a classification backbone that emits heatmaps."""
+    """ConvNeXt-style backbone with a lightweight FPN decoder for heatmaps."""
 
     def __init__(self, backbone_name: str, heatmap_size: int, pretrained: bool) -> None:
         super().__init__()
         self.heatmap_size = heatmap_size
+
+        # ``features_only`` exposes intermediate resolution feature maps instead of
+        # the classification logits (which would collapse spatial information).
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
-            num_classes=heatmap_size * heatmap_size,
-            drop_rate=0.1,
+            features_only=True,
+            out_indices=(1, 2, 3, 4),
+        )
+
+        feature_channels = self.backbone.feature_info.channels()
+        fpn_channels = 256
+
+        self.lateral_convs = nn.ModuleList(
+            nn.Conv2d(ch, fpn_channels, kernel_size=1) for ch in feature_channels
+        )
+        self.output_convs = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            for _ in feature_channels
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(fpn_channels, 1, kernel_size=1),
         )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        logits = self.backbone(images)
-        heatmap = logits.view(-1, 1, self.heatmap_size, self.heatmap_size)
+        features = self.backbone(images)
+
+        # Build a top-down feature pyramid so the heatmap prediction retains
+        # spatial detail.  ``features`` is ordered from high-to-low resolution.
+        pyramid = None
+        for feat, lateral, output in zip(reversed(features), reversed(self.lateral_convs), reversed(self.output_convs)):
+            lateral_feat = lateral(feat)
+            if pyramid is None:
+                pyramid = output(lateral_feat)
+            else:
+                upsampled = F.interpolate(pyramid, size=lateral_feat.shape[-2:], mode="bilinear", align_corners=False)
+                pyramid = output(lateral_feat + upsampled)
+
+        assert pyramid is not None  # pragma: no cover - defensive
+
+        heatmap = self.head(pyramid)
+        heatmap = F.interpolate(
+            heatmap,
+            size=(self.heatmap_size, self.heatmap_size),
+            mode="bilinear",
+            align_corners=False,
+        )
         return heatmap
 
 
