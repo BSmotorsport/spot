@@ -330,37 +330,26 @@ class HeatmapRegressor(nn.Module):
 
         # ``features_only`` exposes intermediate resolution feature maps instead of
         # the classification logits (which would collapse spatial information).
-        # ``timm`` models expose varying numbers of intermediate feature maps.
-        # ``out_indices`` must therefore be chosen dynamically to avoid indexing
-        # past the available entries (ConvNeXt variants, for example, only expose
-        # indices ``0`` through ``3``).  We first instantiate the backbone with
-        # the library defaults so we can inspect how many stages are present and
-        # then request the deepest four maps (or fewer if the architecture is
-        # shallower).
-        provisional_backbone = timm.create_model(
+        # ``timm`` models expose varying numbers of intermediate feature maps so we
+        # adaptively select the deepest four stages (or all of them if fewer are
+        # available) without re-instantiating the backbone.  This avoids asking the
+        # factory for non-existent ``out_indices`` which previously triggered an
+        # ``IndexError`` on backbones that only expose four feature maps (e.g.
+        # ConvNeXt).
+        self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
             features_only=True,
         )
-        available_indices = tuple(range(len(provisional_backbone.feature_info)))
-        if not available_indices:
+
+        feature_channels_all = self.backbone.feature_info.channels()
+        if not feature_channels_all:
             raise RuntimeError(
                 f"Backbone '{backbone_name}' did not expose any feature maps."
             )
 
-        desired_indices = available_indices[-4:]
-
-        if provisional_backbone.feature_info.out_indices == desired_indices:
-            self.backbone = provisional_backbone
-        else:
-            self.backbone = timm.create_model(
-                backbone_name,
-                pretrained=pretrained,
-                features_only=True,
-                out_indices=desired_indices,
-            )
-
-        feature_channels = self.backbone.feature_info.channels()
+        self.feature_slice_start = max(0, len(feature_channels_all) - 4)
+        feature_channels = feature_channels_all[self.feature_slice_start :]
         fpn_channels = 256
 
         self.lateral_convs = nn.ModuleList(
@@ -382,6 +371,8 @@ class HeatmapRegressor(nn.Module):
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         features = self.backbone(images)
+        if self.feature_slice_start:
+            features = features[self.feature_slice_start :]
 
         # Build a top-down feature pyramid so the heatmap prediction retains
         # spatial detail.  ``features`` is ordered from high-to-low resolution.
