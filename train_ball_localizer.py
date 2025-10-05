@@ -750,13 +750,13 @@ def train_one_epoch(
         with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
             loss_map = criterion(outputs, targets)
+            fg_mask = (targets > 0.5).to(dtype=targets.dtype)
             weights = (
-                targets * config.heatmap_fg_weight
-                + (1.0 - targets) * config.heatmap_bg_weight
+                fg_mask * config.heatmap_fg_weight
+                + (1.0 - fg_mask) * config.heatmap_bg_weight
             )
             weighted_loss = loss_map * weights
-            weight_sum = weights.sum()
-            loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
+            loss = weighted_loss.mean()
 
         if scaler is not None and config.amp:
             scaler.scale(loss).backward()
@@ -775,8 +775,9 @@ def train_one_epoch(
                 )
             optimizer.step()
 
-        loss_meter += weighted_loss.sum().detach().item()
-        weight_meter += weight_sum.detach().item()
+        batch_elements = weighted_loss.numel()
+        loss_meter += loss.detach().item() * batch_elements
+        weight_meter += batch_elements
 
         if step % config.log_every == 0:
             avg_loss = loss_meter / max(weight_meter, 1e-12)
@@ -817,13 +818,13 @@ def validate(
 
         outputs = model(images)
         loss_map = criterion(outputs, targets)
+        fg_mask = (targets > 0.5).to(dtype=targets.dtype)
         weights = (
-            targets * config.heatmap_fg_weight
-            + (1.0 - targets) * config.heatmap_bg_weight
+            fg_mask * config.heatmap_fg_weight
+            + (1.0 - fg_mask) * config.heatmap_bg_weight
         )
         weighted_loss = loss_map * weights
-        weight_sum = weights.sum()
-        loss = weighted_loss.sum() / torch.clamp(weight_sum, min=1e-6)
+        loss = weighted_loss.mean()
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.extend(metrics.get("pixel_errors", []))
@@ -832,8 +833,9 @@ def validate(
             probs = torch.sigmoid(outputs)
             sample_exporter.save_batch(batch, probs)
 
-        loss_meter += weighted_loss.sum().item()
-        weight_meter += weight_sum.item()
+        batch_elements = weighted_loss.numel()
+        loss_meter += loss.item() * batch_elements
+        weight_meter += batch_elements
 
     avg_loss = loss_meter / max(weight_meter, 1e-12)
     avg_pixel_error = float(np.mean(pixel_errors)) if pixel_errors else float("nan")
