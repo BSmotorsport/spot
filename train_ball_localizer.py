@@ -78,6 +78,9 @@ class TrainingConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     gradient_clip_norm: float | None = 1.0
+    lr_scheduler_patience: int = 5
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_min_lr: float = 1e-6
 
     # Loss weighting (targets blend linearly between bg/fg weights)
     heatmap_fg_weight: float = 5.0
@@ -590,6 +593,7 @@ class ValidationSampleExporter:
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
     epoch: int,
     config: TrainingConfig,
     scaler: GradScaler | None,
@@ -613,6 +617,8 @@ def save_checkpoint(
     }
     if scaler is not None:
         state["scaler_state"] = scaler.state_dict()
+    if scheduler is not None:
+        state["scheduler_state"] = scheduler.state_dict()
 
     last_path = checkpoint_dir / "last.pth"
     torch.save(state, last_path)
@@ -636,6 +642,7 @@ def resume_from_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler | None,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
     config: TrainingConfig,
 ) -> tuple[int, float]:
     checkpoint_path = resolve_resume_checkpoint(config)
@@ -663,6 +670,8 @@ def resume_from_checkpoint(
 
     if scaler is not None and "scaler_state" in state:
         scaler.load_state_dict(state["scaler_state"])
+    if scheduler is not None and "scheduler_state" in state:
+        scheduler.load_state_dict(state["scheduler_state"])
 
     start_epoch = int(state.get("epoch", 0)) + 1
     best_val_loss = float(state.get("best_val_loss", float("inf")))
@@ -865,6 +874,12 @@ def validate_config(config: TrainingConfig) -> None:
         raise NotADirectoryError(
             f"Output path '{config.output_dir}' exists but is not a directory"
         )
+    if config.lr_scheduler_patience < 0:
+        raise ValueError("lr_scheduler_patience must be non-negative")
+    if not 0.0 < config.lr_scheduler_factor < 1.0:
+        raise ValueError("lr_scheduler_factor must be within (0, 1)")
+    if config.lr_scheduler_min_lr < 0.0:
+        raise ValueError("lr_scheduler_min_lr must be non-negative")
 
 
 # --------------------------------------------------------------------------------------
@@ -888,6 +903,24 @@ def parse_args() -> TrainingConfig:
         type=float,
         default=None,
         help="Validation fraction (grouped by scene)",
+    )
+    parser.add_argument(
+        "--lr-scheduler-patience",
+        type=int,
+        default=None,
+        help="ReduceLROnPlateau patience before reducing the learning rate",
+    )
+    parser.add_argument(
+        "--lr-scheduler-factor",
+        type=float,
+        default=None,
+        help="Multiplicative factor for ReduceLROnPlateau (default: 0.5)",
+    )
+    parser.add_argument(
+        "--lr-scheduler-min-lr",
+        type=float,
+        default=None,
+        help="Lower bound for the learning rate in the scheduler",
     )
     parser.add_argument(
         "--heatmap-fg-weight",
@@ -951,6 +984,12 @@ def parse_args() -> TrainingConfig:
         config.learning_rate = args.learning_rate
     if args.weight_decay is not None:
         config.weight_decay = args.weight_decay
+    if args.lr_scheduler_patience is not None:
+        config.lr_scheduler_patience = args.lr_scheduler_patience
+    if args.lr_scheduler_factor is not None:
+        config.lr_scheduler_factor = args.lr_scheduler_factor
+    if args.lr_scheduler_min_lr is not None:
+        config.lr_scheduler_min_lr = args.lr_scheduler_min_lr
     if args.val_fraction is not None:
         config.val_fraction = args.val_fraction
     if args.heatmap_fg_weight is not None:
@@ -1007,6 +1046,13 @@ def main() -> None:  # pragma: no cover - CLI entry point
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        patience=config.lr_scheduler_patience,
+        factor=config.lr_scheduler_factor,
+        min_lr=config.lr_scheduler_min_lr,
+    )
     scaler = GradScaler(enabled=config.amp)
 
     history_path = config.output_dir / "training_history.json"
@@ -1022,7 +1068,7 @@ def main() -> None:  # pragma: no cover - CLI entry point
     best_val_loss = min(history_best_candidates, default=float("inf"))
 
     start_epoch, checkpoint_best = resume_from_checkpoint(
-        model, optimizer, scaler, config
+        model, optimizer, scaler, scheduler, config
     )
     if np.isfinite(checkpoint_best):
         best_val_loss = min(best_val_loss, checkpoint_best)
@@ -1052,12 +1098,15 @@ def main() -> None:  # pragma: no cover - CLI entry point
 
         current_val_loss = float(val_metrics.get("val_loss", float("inf")))
         is_best = current_val_loss < best_val_loss
+        if scheduler is not None and np.isfinite(current_val_loss):
+            scheduler.step(current_val_loss)
         if is_best:
             best_val_loss = current_val_loss
 
         save_checkpoint(
             model,
             optimizer,
+            scheduler,
             epoch,
             config,
             scaler,
