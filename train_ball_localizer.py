@@ -79,7 +79,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     gradient_clip_norm: float | None = 1.0
 
-    # Loss weighting
+    # Loss weighting (targets blend linearly between bg/fg weights)
     heatmap_fg_weight: float = 5.0
     heatmap_bg_weight: float = 1.0
 
@@ -751,11 +751,8 @@ def train_one_epoch(
         with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
             loss_map = criterion(outputs, targets)
-            fg_mask = (targets > 0.5).to(dtype=targets.dtype)
-            weights = (
-                fg_mask * config.heatmap_fg_weight
-                + (1.0 - fg_mask) * config.heatmap_bg_weight
-            )
+            weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
+            weights = config.heatmap_bg_weight + weight_range * targets
             weighted_loss = loss_map * weights
             loss = weighted_loss.mean()
 
@@ -819,11 +816,8 @@ def validate(
 
         outputs = model(images)
         loss_map = criterion(outputs, targets)
-        fg_mask = (targets > 0.5).to(dtype=targets.dtype)
-        weights = (
-            fg_mask * config.heatmap_fg_weight
-            + (1.0 - fg_mask) * config.heatmap_bg_weight
-        )
+        weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
+        weights = config.heatmap_bg_weight + weight_range * targets
         weighted_loss = loss_map * weights
         loss = weighted_loss.mean()
 
