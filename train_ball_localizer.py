@@ -70,7 +70,7 @@ class TrainingConfig:
     # Image / heatmap geometry
     input_size: int = 1024
     heatmap_size: int = 256
-    heatmap_sigma: float = 2.5
+    heatmap_sigma: float = 6.0
 
     # Optimisation parameters
     batch_size: int = 4
@@ -294,12 +294,13 @@ class BotbBallDataset(Dataset):
         heatmap_scale_y = self.config.heatmap_size / self.config.input_size
         cx = np.clip(transformed_xy[0] * heatmap_scale_x, 0, self.config.heatmap_size - 1)
         cy = np.clip(transformed_xy[1] * heatmap_scale_y, 0, self.config.heatmap_size - 1)
+        sigma = float(self.config.heatmap_sigma)
         heatmap = gaussian_heatmap(
             self.config.heatmap_size,
             self.config.heatmap_size,
             center_x=cx,
             center_y=cy,
-            sigma=self.config.heatmap_sigma,
+            sigma=sigma,
         )
         heatmap_tensor = torch.from_numpy(heatmap).unsqueeze(0)
 
@@ -910,7 +911,12 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--input-size", type=int, default=None, help="Square input resolution")
     parser.add_argument("--heatmap-size", type=int, default=None, help="Predicted heatmap resolution")
-    parser.add_argument("--heatmap-sigma", type=float, default=None, help="Gaussian sigma used to render heatmaps")
+    parser.add_argument(
+        "--heatmap-sigma",
+        type=float,
+        default=None,
+        help="Gaussian sigma used to render heatmaps (default: 6.0)",
+    )
     parser.add_argument(
         "--resume-from",
         type=Path,
