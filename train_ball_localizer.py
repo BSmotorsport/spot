@@ -330,12 +330,35 @@ class HeatmapRegressor(nn.Module):
 
         # ``features_only`` exposes intermediate resolution feature maps instead of
         # the classification logits (which would collapse spatial information).
-        self.backbone = timm.create_model(
+        # ``timm`` models expose varying numbers of intermediate feature maps.
+        # ``out_indices`` must therefore be chosen dynamically to avoid indexing
+        # past the available entries (ConvNeXt variants, for example, only expose
+        # indices ``0`` through ``3``).  We first instantiate the backbone with
+        # the library defaults so we can inspect how many stages are present and
+        # then request the deepest four maps (or fewer if the architecture is
+        # shallower).
+        provisional_backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
             features_only=True,
-            out_indices=(1, 2, 3, 4),
         )
+        available_indices = tuple(range(len(provisional_backbone.feature_info)))
+        if not available_indices:
+            raise RuntimeError(
+                f"Backbone '{backbone_name}' did not expose any feature maps."
+            )
+
+        desired_indices = available_indices[-4:]
+
+        if provisional_backbone.feature_info.out_indices == desired_indices:
+            self.backbone = provisional_backbone
+        else:
+            self.backbone = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                features_only=True,
+                out_indices=desired_indices,
+            )
 
         feature_channels = self.backbone.feature_info.channels()
         fpn_channels = 256
