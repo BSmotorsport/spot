@@ -94,6 +94,8 @@ class TrainingConfig:
     # Model
     backbone_name: str = "convnext_base.fb_in22k_ft_in1k"
     pretrained: bool = True
+    backbone_freeze_epochs: int = 0
+    backbone_unfreeze_warmup: int = 0
 
     # Training utilities
     log_every: int = 50
@@ -590,6 +592,80 @@ class ValidationSampleExporter:
         return x * scale, y * scale
 
 
+def split_backbone_parameters(
+    model: nn.Module,
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Separate backbone parameters from the rest of the model."""
+
+    backbone_params: list[nn.Parameter] = []
+    other_params: list[nn.Parameter] = []
+
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None:
+        backbone_params = list(backbone.parameters())
+        backbone_param_ids = {id(param) for param in backbone_params}
+        other_params = [
+            param
+            for param in model.parameters()
+            if id(param) not in backbone_param_ids
+        ]
+    else:
+        other_params = list(model.parameters())
+
+    return backbone_params, other_params
+
+
+def maybe_freeze_backbone(model: nn.Module, freeze_epochs: int) -> bool:
+    """Freeze the backbone parameters when a freeze schedule is requested."""
+
+    if freeze_epochs > 0 and hasattr(model, "backbone"):
+        model.backbone.requires_grad_(False)
+        return True
+    return False
+
+
+def find_param_group_for_params(
+    optimizer: torch.optim.Optimizer, param_ids: set[int]
+) -> dict | None:
+    """Locate the parameter group that owns the provided parameter ids."""
+
+    for group in optimizer.param_groups:
+        if any(id(param) in param_ids for param in group["params"]):
+            return group
+    return None
+
+
+def compute_backbone_lr_scale(config: TrainingConfig, epoch: int) -> float:
+    """Compute the learning rate scaling factor for the backbone at ``epoch``."""
+
+    if config.backbone_freeze_epochs <= 0:
+        return 1.0
+    if epoch <= config.backbone_freeze_epochs:
+        return 0.0
+
+    warmup = max(config.backbone_unfreeze_warmup, 0)
+    if warmup <= 0:
+        return 1.0
+
+    progress = min(epoch - config.backbone_freeze_epochs, warmup)
+    return progress / warmup
+
+
+def reset_param_group_lrs_to_base(optimizer: torch.optim.Optimizer) -> None:
+    """Restore parameter group learning rates to their stored base values."""
+
+    for group in optimizer.param_groups:
+        base_lr = group.get("base_lr", group["lr"])
+        group["lr"] = base_lr
+
+
+def store_param_group_lrs_as_base(optimizer: torch.optim.Optimizer) -> None:
+    """Record the current learning rates as the new base for each param group."""
+
+    for group in optimizer.param_groups:
+        group["base_lr"] = group.get("lr", group.get("base_lr", 0.0))
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -750,6 +826,7 @@ def train_one_epoch(
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}")
     device = config.device()
     autocast_device_type = device.type
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
 
     for step, batch in enumerate(progress, start=1):
         images = batch["image"].to(device)
@@ -769,17 +846,19 @@ def train_one_epoch(
             scaler.scale(loss).backward()
             if config.gradient_clip_norm is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.gradient_clip_norm
-                )
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_params, config.gradient_clip_norm
+                    )
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
             if config.gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.gradient_clip_norm
-                )
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_params, config.gradient_clip_norm
+                    )
             optimizer.step()
 
         batch_elements = weighted_loss.numel()
@@ -880,6 +959,10 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("lr_scheduler_factor must be within (0, 1)")
     if config.lr_scheduler_min_lr < 0.0:
         raise ValueError("lr_scheduler_min_lr must be non-negative")
+    if config.backbone_freeze_epochs < 0:
+        raise ValueError("backbone_freeze_epochs must be non-negative")
+    if config.backbone_unfreeze_warmup < 0:
+        raise ValueError("backbone_unfreeze_warmup must be non-negative")
 
 
 # --------------------------------------------------------------------------------------
@@ -895,6 +978,18 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--batch-size", type=int, default=None, help="Mini-batch size")
     parser.add_argument(
         "--backbone", type=str, default=None, help="timm backbone name"
+    )
+    parser.add_argument(
+        "--backbone-freeze-epochs",
+        type=int,
+        default=None,
+        help="Number of initial epochs to keep the backbone frozen",
+    )
+    parser.add_argument(
+        "--backbone-unfreeze-warmup",
+        type=int,
+        default=None,
+        help="Epochs to linearly warm up the backbone learning rate after unfreezing",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=None, help="Optimizer weight decay")
@@ -980,6 +1075,10 @@ def parse_args() -> TrainingConfig:
         config.batch_size = args.batch_size
     if args.backbone is not None:
         config.backbone_name = args.backbone
+    if args.backbone_freeze_epochs is not None:
+        config.backbone_freeze_epochs = args.backbone_freeze_epochs
+    if args.backbone_unfreeze_warmup is not None:
+        config.backbone_unfreeze_warmup = args.backbone_unfreeze_warmup
     if args.learning_rate is not None:
         config.learning_rate = args.learning_rate
     if args.weight_decay is not None:
@@ -1043,9 +1142,32 @@ def main() -> None:  # pragma: no cover - CLI entry point
     )
     model.to(config.device())
 
+    backbone_frozen = maybe_freeze_backbone(model, config.backbone_freeze_epochs)
+    backbone_params, other_params = split_backbone_parameters(model)
+    optimizer_param_groups: list[dict[str, object]] = []
+    if other_params:
+        optimizer_param_groups.append({"params": other_params})
+    if backbone_params:
+        optimizer_param_groups.append({"params": backbone_params})
+    if not optimizer_param_groups:
+        raise RuntimeError("No parameters were found for optimisation")
+
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        optimizer_param_groups, lr=config.learning_rate, weight_decay=config.weight_decay
     )
+    for group in optimizer.param_groups:
+        group.setdefault("base_lr", group["lr"])
+
+    backbone_param_ids = {id(param) for param in backbone_params}
+    backbone_group = (
+        find_param_group_for_params(optimizer, backbone_param_ids)
+        if backbone_param_ids
+        else None
+    )
+    if backbone_group is not None:
+        backbone_group.setdefault("base_lr", backbone_group["lr"])
+        if backbone_frozen:
+            backbone_group["lr"] = 0.0
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -1070,6 +1192,18 @@ def main() -> None:  # pragma: no cover - CLI entry point
     start_epoch, checkpoint_best = resume_from_checkpoint(
         model, optimizer, scaler, scheduler, config
     )
+    if backbone_param_ids:
+        backbone_group = find_param_group_for_params(optimizer, backbone_param_ids)
+    for group in optimizer.param_groups:
+        group.setdefault("base_lr", group["lr"])
+    if backbone_group is not None and hasattr(model, "backbone"):
+        if config.backbone_freeze_epochs > 0 and start_epoch <= config.backbone_freeze_epochs:
+            model.backbone.requires_grad_(False)
+            backbone_frozen = True
+            backbone_group["lr"] = 0.0
+        else:
+            model.backbone.requires_grad_(True)
+            backbone_frozen = False
     if np.isfinite(checkpoint_best):
         best_val_loss = min(best_val_loss, checkpoint_best)
 
@@ -1079,6 +1213,19 @@ def main() -> None:  # pragma: no cover - CLI entry point
         ]
 
     for epoch in range(start_epoch, config.num_epochs + 1):
+        if backbone_group is not None and hasattr(model, "backbone"):
+            lr_scale = compute_backbone_lr_scale(config, epoch)
+            base_lr = backbone_group.get("base_lr", backbone_group["lr"])
+            if lr_scale <= 0.0:
+                if not backbone_frozen:
+                    model.backbone.requires_grad_(False)
+                    backbone_frozen = True
+                backbone_group["lr"] = 0.0
+            else:
+                if backbone_frozen:
+                    model.backbone.requires_grad_(True)
+                    backbone_frozen = False
+                backbone_group["lr"] = base_lr * lr_scale
         train_metrics = train_one_epoch(
             model, optimizer, train_loader, scaler, config, epoch
         )
@@ -1098,8 +1245,10 @@ def main() -> None:  # pragma: no cover - CLI entry point
 
         current_val_loss = float(val_metrics.get("val_loss", float("inf")))
         is_best = current_val_loss < best_val_loss
+        reset_param_group_lrs_to_base(optimizer)
         if scheduler is not None and np.isfinite(current_val_loss):
             scheduler.step(current_val_loss)
+        store_param_group_lrs_as_base(optimizer)
         if is_best:
             best_val_loss = current_val_loss
 
