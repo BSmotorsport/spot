@@ -70,7 +70,7 @@ class TrainingConfig:
     # Image / heatmap geometry
     input_size: int = 1024
     heatmap_size: int = 256
-    heatmap_sigma: float = 6.0
+    heatmap_sigma: float = 12.0
 
     # Optimisation parameters
     batch_size: int = 4
@@ -83,7 +83,7 @@ class TrainingConfig:
     lr_scheduler_min_lr: float = 1e-6
 
     # Loss weighting (targets blend linearly between bg/fg weights)
-    heatmap_fg_weight: float = 5.0
+    heatmap_fg_weight: float = 3.0
     heatmap_bg_weight: float = 1.0
 
     # Data loading
@@ -246,7 +246,6 @@ def gaussian_heatmap(
     heatmap = np.exp(
         -((xs - center_x) ** 2 + (ys - center_y) ** 2) / (2.0 * sigma**2)
     )
-    heatmap /= heatmap.max(initial=1e-6)
     return heatmap
 
 
@@ -900,7 +899,7 @@ def train_one_epoch(
     pixel_error_count = 0
     pixel_error_values: list[float] = []
 
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    criterion = nn.MSELoss(reduction="none")
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}")
     device = config.device()
     autocast_device_type = device.type
@@ -988,7 +987,7 @@ def validate(
     epoch: int | None = None,
 ) -> dict[str, float]:
     model.eval()
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    criterion = nn.MSELoss(reduction="none")
 
     loss_meter = 0.0
     weight_meter = 0.0
