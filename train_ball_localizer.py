@@ -420,8 +420,8 @@ def compute_metrics(
         b, _, h, w = probs.shape
         flat = probs.view(b, -1)
         indices = torch.argmax(flat, dim=1)
-        pred_y = (indices // w).float() + 0.5
-        pred_x = (indices % w).float() + 0.5
+        pred_y = (indices // w).float()
+        pred_x = (indices % w).float()
 
         # Convert to the training canvas coordinate system.
         pred_x_canvas = pred_x * (config.input_size / config.heatmap_size)
@@ -586,8 +586,8 @@ class ValidationSampleExporter:
     def _decode_heatmap(self, heatmap: np.ndarray) -> tuple[float, float]:
         h, w = heatmap.shape
         flat_idx = int(np.argmax(heatmap))
-        y = (flat_idx // w) + 0.5
-        x = (flat_idx % w) + 0.5
+        y = float(flat_idx // w)
+        x = float(flat_idx % w)
         scale = self.config.input_size / self.config.heatmap_size
         return x * scale, y * scale
 
