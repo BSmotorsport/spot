@@ -810,6 +810,19 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
+def compute_weighted_loss_components(
+    loss_map: torch.Tensor, targets: torch.Tensor, config: TrainingConfig
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the normalised loss along with its raw components."""
+
+    weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
+    weights = config.heatmap_bg_weight + weight_range * targets
+    weighted_loss = loss_map * weights
+    weight_sum = weights.sum(dtype=torch.float32)
+    loss = weighted_loss.sum(dtype=torch.float32) / (weight_sum + 1e-12)
+    return loss, weighted_loss, weight_sum
+
+
 def train_one_epoch(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -837,11 +850,12 @@ def train_one_epoch(
         with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
             loss_map = criterion(outputs, targets)
-            weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
-            weights = config.heatmap_bg_weight + weight_range * targets
-            weighted_loss = loss_map * weights
-            weight_sum = weights.sum()
-            loss = weighted_loss.sum() / (weight_sum + 1e-12)
+
+        (
+            loss,
+            weighted_loss,
+            weight_sum,
+        ) = compute_weighted_loss_components(loss_map, targets, config)
 
         if scaler is not None and config.amp:
             scaler.scale(loss).backward()
@@ -862,7 +876,9 @@ def train_one_epoch(
                     )
             optimizer.step()
 
-        weighted_loss_sum = weighted_loss.detach().sum().item()
+        weighted_loss_sum = (
+            weighted_loss.detach().sum(dtype=torch.float32).item()
+        )
         weight_sum_value = weight_sum.detach().item()
         loss_meter += weighted_loss_sum
         weight_meter += weight_sum_value
@@ -906,11 +922,9 @@ def validate(
 
         outputs = model(images)
         loss_map = criterion(outputs, targets)
-        weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
-        weights = config.heatmap_bg_weight + weight_range * targets
-        weighted_loss = loss_map * weights
-        weight_sum = weights.sum()
-        loss = weighted_loss.sum() / (weight_sum + 1e-12)
+        loss, weighted_loss, weight_sum = compute_weighted_loss_components(
+            loss_map, targets, config
+        )
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.extend(metrics.get("pixel_errors", []))
@@ -919,7 +933,9 @@ def validate(
             probs = torch.sigmoid(outputs)
             sample_exporter.save_batch(batch, probs)
 
-        weighted_loss_sum = weighted_loss.detach().sum().item()
+        weighted_loss_sum = (
+            weighted_loss.detach().sum(dtype=torch.float32).item()
+        )
         weight_sum_value = weight_sum.detach().item()
         loss_meter += weighted_loss_sum
         weight_meter += weight_sum_value
