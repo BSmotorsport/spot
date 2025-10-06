@@ -423,9 +423,12 @@ def compute_metrics(
         pred_y = (indices // w).float()
         pred_x = (indices % w).float()
 
-        # Convert to the training canvas coordinate system.
-        pred_x_canvas = pred_x * (config.input_size / config.heatmap_size)
-        pred_y_canvas = pred_y * (config.input_size / config.heatmap_size)
+        # Convert to the training canvas coordinate system.  ``+ 0.5`` ensures
+        # the decoded point corresponds to the centre of the winning heatmap
+        # cell rather than its top-left corner (see dataset encoding).
+        stride = config.input_size / config.heatmap_size
+        pred_x_canvas = (pred_x + 0.5) * stride
+        pred_y_canvas = (pred_y + 0.5) * stride
 
         pad = batch["pad"].to(outputs.device)
         scale = batch["scale"].to(outputs.device)
@@ -589,7 +592,7 @@ class ValidationSampleExporter:
         y = float(flat_idx // w)
         x = float(flat_idx % w)
         scale = self.config.input_size / self.config.heatmap_size
-        return x * scale, y * scale
+        return (x + 0.5) * scale, (y + 0.5) * scale
 
 
 def split_backbone_parameters(

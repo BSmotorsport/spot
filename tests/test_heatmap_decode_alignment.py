@@ -15,7 +15,7 @@ def test_compute_metrics_returns_unbiased_coordinates():
     batch = {
         "pad": torch.zeros(1, 2),
         "scale": torch.ones(1),
-        "original_xy": torch.tensor([[128.0, 64.0]]),
+        "original_xy": torch.tensor([[160.0, 96.0]]),
     }
 
     metrics = compute_metrics(outputs, batch, config)
@@ -34,5 +34,5 @@ def test_decode_heatmap_matches_encoding(tmp_path):
 
     decoded_x, decoded_y = exporter._decode_heatmap(heatmap)
 
-    assert decoded_x == pytest.approx(128.0)
-    assert decoded_y == pytest.approx(64.0)
+    assert decoded_x == pytest.approx(160.0)
+    assert decoded_y == pytest.approx(96.0)
