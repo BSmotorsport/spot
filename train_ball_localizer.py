@@ -840,7 +840,8 @@ def train_one_epoch(
             weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
             weights = config.heatmap_bg_weight + weight_range * targets
             weighted_loss = loss_map * weights
-            loss = weighted_loss.mean()
+            weight_sum = weights.sum()
+            loss = weighted_loss.sum() / (weight_sum + 1e-12)
 
         if scaler is not None and config.amp:
             scaler.scale(loss).backward()
@@ -861,9 +862,10 @@ def train_one_epoch(
                     )
             optimizer.step()
 
-        batch_elements = weighted_loss.numel()
-        loss_meter += loss.detach().item() * batch_elements
-        weight_meter += batch_elements
+        weighted_loss_sum = weighted_loss.detach().sum().item()
+        weight_sum_value = weight_sum.detach().item()
+        loss_meter += weighted_loss_sum
+        weight_meter += weight_sum_value
 
         if step % config.log_every == 0:
             avg_loss = loss_meter / max(weight_meter, 1e-12)
@@ -907,7 +909,8 @@ def validate(
         weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
         weights = config.heatmap_bg_weight + weight_range * targets
         weighted_loss = loss_map * weights
-        loss = weighted_loss.mean()
+        weight_sum = weights.sum()
+        loss = weighted_loss.sum() / (weight_sum + 1e-12)
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.extend(metrics.get("pixel_errors", []))
@@ -916,9 +919,10 @@ def validate(
             probs = torch.sigmoid(outputs)
             sample_exporter.save_batch(batch, probs)
 
-        batch_elements = weighted_loss.numel()
-        loss_meter += loss.item() * batch_elements
-        weight_meter += batch_elements
+        weighted_loss_sum = weighted_loss.detach().sum().item()
+        weight_sum_value = weight_sum.detach().item()
+        loss_meter += weighted_loss_sum
+        weight_meter += weight_sum_value
 
     avg_loss = loss_meter / max(weight_meter, 1e-12)
     avg_pixel_error = float(np.mean(pixel_errors)) if pixel_errors else float("nan")
