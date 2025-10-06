@@ -844,6 +844,9 @@ def train_one_epoch(
     model.train()
     loss_meter = 0.0
     weight_meter = 0.0
+    pixel_error_sum = 0.0
+    pixel_error_count = 0
+    pixel_error_values: list[float] = []
 
     criterion = nn.BCEWithLogitsLoss(reduction="none")
     progress = tqdm(dataloader, desc=f"Train {epoch:03d}")
@@ -860,6 +863,13 @@ def train_one_epoch(
         with autocast(device_type=autocast_device_type, enabled=config.amp):
             outputs = model(images)
             loss_map = criterion(outputs, targets)
+
+        metrics = compute_metrics(outputs, batch, config)
+        batch_pixel_errors = metrics.get("pixel_errors", [])
+        if batch_pixel_errors:
+            pixel_error_sum += float(sum(batch_pixel_errors))
+            pixel_error_count += len(batch_pixel_errors)
+            pixel_error_values.extend(float(err) for err in batch_pixel_errors)
 
         (
             loss,
@@ -895,10 +905,26 @@ def train_one_epoch(
 
         if step % config.log_every == 0:
             avg_loss = loss_meter / max(weight_meter, 1e-12)
-            progress.set_postfix({"loss": avg_loss})
+            running_metrics: dict[str, float] = {"loss": avg_loss}
+            if pixel_error_count > 0:
+                running_metrics["pixel_mae"] = pixel_error_sum / pixel_error_count
+                running_metrics["pixel_median"] = float(
+                    np.median(pixel_error_values)
+                )
+            progress.set_postfix(running_metrics)
 
     avg_loss = loss_meter / max(weight_meter, 1e-12)
-    return {"loss": avg_loss}
+    avg_pixel_mae = (
+        pixel_error_sum / pixel_error_count if pixel_error_count > 0 else float("nan")
+    )
+    avg_pixel_median = (
+        float(np.median(pixel_error_values)) if pixel_error_values else float("nan")
+    )
+    return {
+        "loss": avg_loss,
+        "pixel_mae": avg_pixel_mae,
+        "pixel_median": avg_pixel_median,
+    }
 
 
 @torch.no_grad()
@@ -1261,7 +1287,9 @@ def main() -> None:  # pragma: no cover - CLI entry point
         )
         val_metrics = validate(model, val_loader, config, epoch=epoch)
 
-        combined = {**train_metrics, **val_metrics, "epoch": epoch}
+        combined = {"epoch": epoch}
+        combined.update({f"train_{k}": v for k, v in train_metrics.items()})
+        combined.update(val_metrics)
         combined["heatmap_fg_weight"] = config.heatmap_fg_weight
         combined["heatmap_bg_weight"] = config.heatmap_bg_weight
         history.append(combined)
@@ -1269,6 +1297,8 @@ def main() -> None:  # pragma: no cover - CLI entry point
         print(
             f"Epoch {epoch:03d} | "
             f"train_loss={train_metrics['loss']:.4f} | "
+            f"train_pixel_mae={train_metrics['pixel_mae']:.2f} | "
+            f"train_pixel_median={train_metrics['pixel_median']:.2f} | "
             f"val_loss={val_metrics['val_loss']:.4f} | "
             f"val_pixel_mae={val_metrics['val_pixel_mae']:.2f}"
         )
