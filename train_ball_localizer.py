@@ -241,12 +241,19 @@ def gaussian_heatmap(
 ) -> np.ndarray:
     """Generate a 2D Gaussian heatmap centered on (``center_x``, ``center_y``)."""
 
+    # ``numpy`` defaults to ``float64`` for scalar inputs which caused the
+    # generated heatmaps to become ``float64`` tensors when converted with
+    # ``torch.from_numpy``.  The training loop expects ``float32`` tensors so we
+    # explicitly perform the computation in single precision.
+    center_x32 = np.float32(center_x)
+    center_y32 = np.float32(center_y)
+    sigma32 = np.float32(sigma)
+
     xs = np.arange(width, dtype=np.float32)
     ys = np.arange(height, dtype=np.float32)[:, None]
-    heatmap = np.exp(
-        -((xs - center_x) ** 2 + (ys - center_y) ** 2) / (2.0 * sigma**2)
-    )
-    return heatmap
+    two_sigma_sq = np.float32(2.0) * sigma32 * sigma32
+    heatmap = np.exp(-((xs - center_x32) ** 2 + (ys - center_y32) ** 2) / two_sigma_sq)
+    return heatmap.astype(np.float32)
 
 
 class BotbBallDataset(Dataset):
