@@ -425,10 +425,15 @@ def compute_metrics(
 
         # Convert to the training canvas coordinate system.  ``+ 0.5`` ensures
         # the decoded point corresponds to the centre of the winning heatmap
-        # cell rather than its top-left corner (see dataset encoding).
+        # cell rather than its top-left corner (see dataset encoding).  The
+        # dataset clamps keypoints to the heatmap boundaries before rendering,
+        # so boundary indices already represent the centre of the outermost
+        # cell—skip the offset there to avoid nudging edge predictions inward.
         stride = config.input_size / config.heatmap_size
-        pred_x_canvas = (pred_x + 0.5) * stride
-        pred_y_canvas = (pred_y + 0.5) * stride
+        interior_x = (pred_x > 0.0) & (pred_x < float(w - 1))
+        interior_y = (pred_y > 0.0) & (pred_y < float(h - 1))
+        pred_x_canvas = (pred_x + interior_x.float() * 0.5) * stride
+        pred_y_canvas = (pred_y + interior_y.float() * 0.5) * stride
 
         pad = batch["pad"].to(outputs.device)
         scale = batch["scale"].to(outputs.device)
@@ -592,7 +597,9 @@ class ValidationSampleExporter:
         y = float(flat_idx // w)
         x = float(flat_idx % w)
         scale = self.config.input_size / self.config.heatmap_size
-        return (x + 0.5) * scale, (y + 0.5) * scale
+        offset_x = 0.5 if 0.0 < x < (w - 1) else 0.0
+        offset_y = 0.5 if 0.0 < y < (h - 1) else 0.0
+        return (x + offset_x) * scale, (y + offset_y) * scale
 
 
 def split_backbone_parameters(
