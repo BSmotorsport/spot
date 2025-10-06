@@ -68,3 +68,24 @@ def test_decode_heatmap_respects_boundary_cells(tmp_path):
 
     assert decoded_x == pytest.approx(0.0)
     assert decoded_y == pytest.approx(0.0)
+
+
+def test_compute_metrics_corrects_for_random_flips():
+    config = TrainingConfig(input_size=256, heatmap_size=4)
+
+    outputs = torch.full((1, 1, 4, 4), -10.0)
+    # Simulate a prediction that selects column 2 on the flipped heatmap.
+    outputs[0, 0, 1, 2] = 10.0
+
+    batch = {
+        "pad": torch.zeros(1, 2),
+        "scale": torch.ones(1),
+        "original_xy": torch.tensor([[64.0, 96.0]]),
+        "was_flipped": torch.tensor([True]),
+    }
+
+    metrics = compute_metrics(outputs, batch, config)
+
+    assert metrics["pixel_mae"] == pytest.approx(0.0)
+    assert metrics["pixel_median"] == pytest.approx(0.0)
+    assert metrics["pixel_errors"] == [0.0]
