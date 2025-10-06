@@ -429,10 +429,38 @@ def compute_metrics(
     with torch.no_grad():
         probs = torch.sigmoid(outputs)
         b, _, h, w = probs.shape
+        flip_flags = batch.get("was_flipped")
+        if flip_flags is None:
+            flip_tensor = torch.zeros(
+                b, dtype=torch.bool, device=outputs.device
+            )
+        else:
+            flip_tensor = flip_flags.to(outputs.device)
+            if flip_tensor.dtype != torch.bool:
+                flip_tensor = flip_tensor.to(dtype=torch.bool)
+            if flip_tensor.ndim == 0:
+                flip_tensor = flip_tensor.unsqueeze(0).expand(b)
+        flip_tensor = flip_tensor.reshape(-1)
+        if flip_tensor.shape[0] < b:
+            pad_count = b - flip_tensor.shape[0]
+            pad_tensor = torch.zeros(
+                pad_count, dtype=torch.bool, device=flip_tensor.device
+            )
+            flip_tensor = torch.cat([flip_tensor, pad_tensor], dim=0)
+        elif flip_tensor.shape[0] > b:
+            flip_tensor = flip_tensor[:b]
+
         flat = probs.view(b, -1)
         indices = torch.argmax(flat, dim=1)
         pred_y = (indices // w).float()
         pred_x = (indices % w).float()
+
+        if flip_tensor.any():
+            pred_x = torch.where(
+                flip_tensor,
+                (float(w - 1)) - pred_x,
+                pred_x,
+            )
 
         # Convert to the training canvas coordinate system.  ``+ 0.5`` ensures
         # the decoded point corresponds to the centre of the winning heatmap
@@ -445,25 +473,6 @@ def compute_metrics(
         interior_y = (pred_y > 0.0) & (pred_y < float(h - 1))
         pred_x_canvas = (pred_x + interior_x.float() * 0.5) * stride
         pred_y_canvas = (pred_y + interior_y.float() * 0.5) * stride
-
-        flip_flags = batch.get("was_flipped")
-        if flip_flags is None:
-            flip_tensor = torch.zeros(
-                b, dtype=torch.bool, device=outputs.device
-            )
-        else:
-            flip_tensor = flip_flags.to(outputs.device)
-            if flip_tensor.dtype != torch.bool:
-                flip_tensor = flip_tensor.to(dtype=torch.bool)
-            if flip_tensor.ndim == 0:
-                flip_tensor = flip_tensor.unsqueeze(0).expand(b)
-
-        canvas_width = float(config.input_size)
-        pred_x_canvas = torch.where(
-            flip_tensor,
-            (canvas_width - 1.0) - pred_x_canvas,
-            pred_x_canvas,
-        )
 
         pad = batch["pad"].to(outputs.device)
         scale = batch["scale"].to(outputs.device)
