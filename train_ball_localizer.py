@@ -91,6 +91,17 @@ class TrainingConfig:
     val_fraction: float = 0.2
     random_seed: int = 1337
 
+    # Geometric augmentation
+    enable_spatial_aug: bool = False
+    spatial_flip_prob: float = 0.5
+    spatial_shift_limit: float = 0.02
+    spatial_scale_limit: float = 0.05
+    spatial_rotate_limit: float = 5.0
+    spatial_shift_scale_prob: float = 0.75
+    spatial_crop_prob: float = 0.2
+    spatial_crop_scale_min: float = 0.9
+    spatial_crop_scale_max: float = 1.0
+
     # Model
     backbone_name: str = "convnext_base.fb_in22k_ft_in1k"
     pretrained: bool = True
@@ -254,9 +265,49 @@ class BotbBallDataset(Dataset):
         self.config = config
         self.is_train = is_train
         self.color_transform = color_transform
+        self._enable_spatial_aug = self.is_train and self.config.enable_spatial_aug
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.records)
+
+    def _build_spatial_transform(self, height: int, width: int) -> A.Compose:
+        transforms: list[A.BasicTransform] = []
+        if self.config.spatial_flip_prob > 0.0:
+            transforms.append(A.HorizontalFlip(p=self.config.spatial_flip_prob))
+        if self.config.spatial_shift_scale_prob > 0.0:
+            transforms.append(
+                A.ShiftScaleRotate(
+                    shift_limit=self.config.spatial_shift_limit,
+                    scale_limit=self.config.spatial_scale_limit,
+                    rotate_limit=self.config.spatial_rotate_limit,
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=self.config.spatial_shift_scale_prob,
+                )
+            )
+        if (
+            self.config.spatial_crop_prob > 0.0
+            and self.config.spatial_crop_scale_min < self.config.spatial_crop_scale_max
+        ):
+            transforms.append(
+                A.RandomResizedCrop(
+                    height=height,
+                    width=width,
+                    scale=(
+                        self.config.spatial_crop_scale_min,
+                        self.config.spatial_crop_scale_max,
+                    ),
+                    ratio=(1.0, 1.0),
+                    p=self.config.spatial_crop_prob,
+                )
+            )
+
+        if not transforms:
+            transforms.append(A.NoOp())
+
+        return A.Compose(
+            transforms,
+            keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+        )
 
     def __getitem__(self, index: int) -> dict[str, object]:
         record = self.records[index]
@@ -265,13 +316,27 @@ class BotbBallDataset(Dataset):
             raise RuntimeError(f"Failed to load image '{record.path}'")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
+        keypoint_xy = (float(record.x), float(record.y))
+        if self._enable_spatial_aug:
+            h, w = image.shape[:2]
+            spatial_transform = self._build_spatial_transform(h, w)
+            augmented = spatial_transform(image=image, keypoints=[keypoint_xy])
+            image = augmented["image"]
+            if not augmented["keypoints"]:
+                # Fallback: retain the original coordinates if augmentation dropped them.
+                keypoint_xy = (float(record.x), float(record.y))
+            else:
+                aug_x, aug_y = augmented["keypoints"][0]
+                keypoint_xy = (float(aug_x), float(aug_y))
+
         # Geometry: resize+pad to a square canvas.  Some BOTB files represent
         # pre-flipped imagery (the filename already encodes the mirrored
-        # coordinates) so we deliberately avoid additional geometric
-        # augmentations here—any further flipping risks corrupting the
-        # ground-truth supervision.
+        # coordinates) so the default behaviour avoids additional geometric
+        # augmentations.  When enabled via :class:`TrainingConfig` the optional
+        # spatial jitter runs *before* the resize so bookkeeping stays
+        # consistent.
         canvas, transformed_xy, scale, pad_x, pad_y = _prepare_canvas(
-            image, (record.x, record.y), self.config.input_size
+            image, keypoint_xy, self.config.input_size
         )
 
         # Appearance augmentation after geometry is fixed.
@@ -303,7 +368,7 @@ class BotbBallDataset(Dataset):
             "image": canvas_tensor,
             "heatmap": heatmap_tensor,
             "input_xy": torch.tensor(transformed_xy, dtype=torch.float32),
-            "original_xy": torch.tensor((record.x, record.y), dtype=torch.float32),
+            "original_xy": torch.tensor(keypoint_xy, dtype=torch.float32),
             "scale": torch.tensor(scale, dtype=torch.float32),
             "pad": torch.tensor((pad_x, pad_y), dtype=torch.float32),
             "scene_id": record.scene_id,
