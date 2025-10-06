@@ -96,6 +96,7 @@ class TrainingConfig:
     pretrained: bool = True
     backbone_freeze_epochs: int = 0
     backbone_unfreeze_warmup: int = 0
+    decoder_dropout: float = 0.0
 
     # Training utilities
     log_every: int = 50
@@ -319,9 +320,16 @@ class BotbBallDataset(Dataset):
 class HeatmapRegressor(nn.Module):
     """ConvNeXt-style backbone with a lightweight FPN decoder for heatmaps."""
 
-    def __init__(self, backbone_name: str, heatmap_size: int, pretrained: bool) -> None:
+    def __init__(
+        self,
+        backbone_name: str,
+        heatmap_size: int,
+        pretrained: bool,
+        decoder_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         self.heatmap_size = heatmap_size
+        self.decoder_dropout = float(decoder_dropout)
 
         # ``features_only`` exposes intermediate resolution feature maps instead of
         # the classification logits (which would collapse spatial information).
@@ -350,19 +358,27 @@ class HeatmapRegressor(nn.Module):
         self.lateral_convs = nn.ModuleList(
             nn.Conv2d(ch, fpn_channels, kernel_size=1) for ch in feature_channels
         )
-        self.output_convs = nn.ModuleList(
-            nn.Sequential(
+        def make_decoder_block() -> nn.Sequential:
+            layers: list[nn.Module] = [
                 nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1),
                 nn.GELU(),
-            )
-            for _ in feature_channels
+            ]
+            if self.decoder_dropout > 0.0:
+                layers.append(nn.Dropout2d(self.decoder_dropout))
+            return nn.Sequential(*layers)
+
+        self.output_convs = nn.ModuleList(
+            make_decoder_block() for _ in feature_channels
         )
 
-        self.head = nn.Sequential(
+        head_layers: list[nn.Module] = [
             nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(fpn_channels, 1, kernel_size=1),
-        )
+        ]
+        if self.decoder_dropout > 0.0:
+            head_layers.append(nn.Dropout(self.decoder_dropout))
+        head_layers.append(nn.Conv2d(fpn_channels, 1, kernel_size=1))
+        self.head = nn.Sequential(*head_layers)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         features = self.backbone(images)
@@ -1008,6 +1024,10 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("backbone_freeze_epochs must be non-negative")
     if config.backbone_unfreeze_warmup < 0:
         raise ValueError("backbone_unfreeze_warmup must be non-negative")
+    if config.decoder_dropout < 0.0:
+        raise ValueError("decoder_dropout must be non-negative")
+    if config.decoder_dropout >= 1.0:
+        raise ValueError("decoder_dropout must be less than 1.0")
 
 
 # --------------------------------------------------------------------------------------
@@ -1035,6 +1055,12 @@ def parse_args() -> TrainingConfig:
         type=int,
         default=None,
         help="Epochs to linearly warm up the backbone learning rate after unfreezing",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=None,
+        help="Dropout rate applied in the decoder head (default: 0.0)",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=None, help="Optimizer weight decay")
@@ -1124,6 +1150,8 @@ def parse_args() -> TrainingConfig:
         config.backbone_freeze_epochs = args.backbone_freeze_epochs
     if args.backbone_unfreeze_warmup is not None:
         config.backbone_unfreeze_warmup = args.backbone_unfreeze_warmup
+    if args.decoder_dropout is not None:
+        config.decoder_dropout = args.decoder_dropout
     if args.learning_rate is not None:
         config.learning_rate = args.learning_rate
     if args.weight_decay is not None:
@@ -1183,7 +1211,10 @@ def main() -> None:  # pragma: no cover - CLI entry point
     train_loader, val_loader = create_dataloaders(train_records, val_records, config)
 
     model = HeatmapRegressor(
-        config.backbone_name, config.heatmap_size, pretrained=config.pretrained
+        config.backbone_name,
+        config.heatmap_size,
+        pretrained=config.pretrained,
+        decoder_dropout=config.decoder_dropout,
     )
     model.to(config.device())
 
