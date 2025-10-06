@@ -218,17 +218,18 @@ def _maybe_horizontal_flip(
     image: np.ndarray,
     xy: Tuple[float, float],
     p: float = 0.5,
-) -> tuple[np.ndarray, Tuple[float, float]]:
+) -> tuple[np.ndarray, Tuple[float, float], bool]:
     """Randomly mirror the square image (and associated keypoint)."""
 
+    flipped = False
     if random.random() > p:
-        return image, xy
+        return image, xy, flipped
 
     flipped = cv2.flip(image, 1)
     h, w = flipped.shape[:2]
     x, y = xy
     flipped_xy = (w - 1 - x, y)
-    return flipped, flipped_xy
+    return flipped, flipped_xy, True
 
 
 def gaussian_heatmap(
@@ -281,8 +282,11 @@ class BotbBallDataset(Dataset):
         )
 
         # Optional geometric augmentation (horizontal flip).
+        flipped = False
         if self.is_train:
-            canvas, transformed_xy = _maybe_horizontal_flip(canvas, transformed_xy, p=0.5)
+            canvas, transformed_xy, flipped = _maybe_horizontal_flip(
+                canvas, transformed_xy, p=0.5
+            )
 
         # Appearance augmentation after geometry is fixed.
         if self.color_transform is not None:
@@ -318,6 +322,7 @@ class BotbBallDataset(Dataset):
             "pad": torch.tensor((pad_x, pad_y), dtype=torch.float32),
             "scene_id": record.scene_id,
             "path": str(record.path),
+            "was_flipped": torch.tensor(flipped, dtype=torch.bool),
         }
         return sample
 
@@ -435,6 +440,25 @@ def compute_metrics(
         pred_x_canvas = (pred_x + interior_x.float() * 0.5) * stride
         pred_y_canvas = (pred_y + interior_y.float() * 0.5) * stride
 
+        flip_flags = batch.get("was_flipped")
+        if flip_flags is None:
+            flip_tensor = torch.zeros(
+                b, dtype=torch.bool, device=outputs.device
+            )
+        else:
+            flip_tensor = flip_flags.to(outputs.device)
+            if flip_tensor.dtype != torch.bool:
+                flip_tensor = flip_tensor.to(dtype=torch.bool)
+            if flip_tensor.ndim == 0:
+                flip_tensor = flip_tensor.unsqueeze(0).expand(b)
+
+        canvas_width = float(config.input_size)
+        pred_x_canvas = torch.where(
+            flip_tensor,
+            (canvas_width - 1.0) - pred_x_canvas,
+            pred_x_canvas,
+        )
+
         pad = batch["pad"].to(outputs.device)
         scale = batch["scale"].to(outputs.device)
         original_pred_x = (pred_x_canvas - pad[:, 0]) / scale
@@ -485,12 +509,30 @@ class ValidationSampleExporter:
         pads = batch["pad"]
         scales = batch["scale"]
         paths = batch["path"]
+        flip_flags = batch.get("was_flipped")
 
         batch_size = int(images.shape[0])
         remaining = self.max_samples - self.saved
         export_count = min(batch_size, remaining)
 
         probs = probs.detach().cpu()
+
+        if flip_flags is None:
+            flip_tensor = torch.zeros(batch_size, dtype=torch.bool)
+        else:
+            flip_tensor = flip_flags.detach().cpu()
+            if flip_tensor.dtype != torch.bool:
+                flip_tensor = flip_tensor.to(dtype=torch.bool)
+            if flip_tensor.ndim == 0:
+                flip_tensor = flip_tensor.repeat(batch_size)
+            flip_tensor = flip_tensor.reshape(-1)
+            if flip_tensor.shape[0] < batch_size:
+                pad_count = batch_size - flip_tensor.shape[0]
+                flip_tensor = torch.cat(
+                    [flip_tensor, torch.zeros(pad_count, dtype=torch.bool)], dim=0
+                )
+            elif flip_tensor.shape[0] > batch_size:
+                flip_tensor = flip_tensor[:batch_size]
 
         for idx in range(export_count):
             image_tensor = images[idx]
@@ -499,8 +541,18 @@ class ValidationSampleExporter:
             pred_heatmap = probs[idx, 0].numpy()
             target_heatmap = targets[idx, 0].detach().cpu().numpy()
 
+            was_flipped = bool(flip_tensor[idx].item())
+            if was_flipped:
+                image = cv2.flip(image, 1)
+                pred_heatmap = np.fliplr(pred_heatmap)
+                target_heatmap = np.fliplr(target_heatmap)
+
             pred_canvas_xy = self._decode_heatmap(pred_heatmap)
             gt_canvas_xy = input_xy[idx].detach().cpu().numpy()
+            if was_flipped:
+                canvas_width = float(image.shape[1])
+                gt_canvas_xy = gt_canvas_xy.copy()
+                gt_canvas_xy[0] = canvas_width - 1.0 - gt_canvas_xy[0]
             pad = pads[idx].detach().cpu().numpy()
             scale = float(scales[idx].detach().cpu().item())
             gt_original_xy = original_xy[idx].detach().cpu().numpy()
