@@ -555,7 +555,6 @@ class ValidationSampleExporter:
         pads = batch["pad"]
         scales = batch["scale"]
         paths = batch["path"]
-
         batch_size = int(images.shape[0])
         remaining = self.max_samples - self.saved
         export_count = min(batch_size, remaining)
@@ -569,25 +568,27 @@ class ValidationSampleExporter:
             pred_heatmap = probs[idx, 0].numpy()
             target_heatmap = targets[idx, 0].detach().cpu().numpy()
 
-            pred_canvas_xy = self._decode_heatmap(pred_heatmap)
+            pred_canvas_xy_display = self._decode_heatmap(pred_heatmap)
+            pred_canvas_xy_for_error = pred_canvas_xy_display
+
             gt_canvas_xy = input_xy[idx].detach().cpu().numpy()
             pad = pads[idx].detach().cpu().numpy()
             scale = float(scales[idx].detach().cpu().item())
             gt_original_xy = original_xy[idx].detach().cpu().numpy()
             pred_original_xy = (
-                (pred_canvas_xy[0] - pad[0]) / scale,
-                (pred_canvas_xy[1] - pad[1]) / scale,
+                (pred_canvas_xy_for_error[0] - pad[0]) / scale,
+                (pred_canvas_xy_for_error[1] - pad[1]) / scale,
             )
             pixel_error = float(
                 np.linalg.norm(np.array(pred_original_xy) - gt_original_xy)
             )
 
             annotated = self._annotate_points(
-                image.copy(), pred_canvas_xy, gt_canvas_xy
+                image.copy(), pred_canvas_xy_display, gt_canvas_xy
             )
             pred_overlay = self._heatmap_overlay(image.copy(), pred_heatmap)
             pred_overlay = self._annotate_points(
-                pred_overlay, pred_canvas_xy, gt_canvas_xy
+                pred_overlay, pred_canvas_xy_display, gt_canvas_xy
             )
             target_overlay = self._heatmap_overlay(image.copy(), target_heatmap)
             target_overlay = self._annotate_points(
@@ -599,7 +600,8 @@ class ValidationSampleExporter:
             )
 
             info_text = (
-                f"pred canvas=({pred_canvas_xy[0]:.1f}, {pred_canvas_xy[1]:.1f}) "
+                f"pred canvas=({pred_canvas_xy_display[0]:.1f}, "
+                f"{pred_canvas_xy_display[1]:.1f}) "
                 f"| gt canvas=({gt_canvas_xy[0]:.1f}, {gt_canvas_xy[1]:.1f}) "
                 f"| pixel err={pixel_error:.2f}"
             )
