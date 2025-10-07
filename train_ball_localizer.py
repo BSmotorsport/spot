@@ -93,7 +93,8 @@ class TrainingConfig:
     random_seed: int = 1337
 
     # Geometric augmentation
-    enable_spatial_aug: bool = False
+    enable_spatial_aug: bool = True
+    enable_color_aug: bool = True
     spatial_flip_prob: float = 0.5
     spatial_shift_limit: float = 0.02
     spatial_scale_limit: float = 0.05
@@ -103,13 +104,25 @@ class TrainingConfig:
     spatial_crop_scale_min: float = 0.9
     spatial_crop_scale_max: float = 1.0
 
+    # Appearance augmentation
+    color_aug_prob: float = 0.9
+    color_jitter_strength: float = 0.25
+    grayscale_prob: float = 0.05
+    blur_prob: float = 0.1
+    noise_prob: float = 0.2
+    random_gamma_prob: float = 0.15
+    channel_dropout_prob: float = 0.05
+    coarse_dropout_prob: float = 0.25
+    coarse_dropout_max_holes: int = 8
+    coarse_dropout_max_size: float = 0.08
+
     # Model
     backbone_name: str = "convnext_base.fb_in22k_ft_in1k"
     pretrained: bool = True
     backbone_freeze_epochs: int = 0
     backbone_unfreeze_warmup: int = 0
     backbone_lr_multiplier: float = 0.1
-    decoder_dropout: float = 0.0
+    decoder_dropout: float = 0.15
 
     # Training utilities
     log_every: int = 50
@@ -379,6 +392,94 @@ class BotbBallDataset(Dataset):
             "path": str(record.path),
         }
         return sample
+
+
+# --------------------------------------------------------------------------------------
+# Augmentation helpers
+# --------------------------------------------------------------------------------------
+
+
+def build_color_augmentation(config: TrainingConfig) -> A.BasicTransform | None:
+    """Construct a rich appearance augmentation pipeline."""
+
+    if not config.enable_color_aug:
+        return None
+
+    transforms: list[A.BasicTransform] = []
+
+    if config.color_aug_prob > 0.0:
+        jitter = max(config.color_jitter_strength, 0.0)
+        color_variants: list[A.BasicTransform] = [
+            A.ColorJitter(
+                brightness=jitter,
+                contrast=jitter,
+                saturation=jitter,
+                hue=min(jitter * 0.5, 0.5),
+                p=1.0,
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=jitter,
+                contrast_limit=jitter,
+                p=1.0,
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=int(20 * jitter + 1),
+                sat_shift_limit=int(30 * jitter + 1),
+                val_shift_limit=int(20 * jitter + 1),
+                p=1.0,
+            ),
+            A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=1.0),
+        ]
+        transforms.append(A.OneOf(color_variants, p=config.color_aug_prob))
+
+    if config.random_gamma_prob > 0.0:
+        transforms.append(A.RandomGamma(gamma_limit=(80, 120), p=config.random_gamma_prob))
+
+    if config.blur_prob > 0.0:
+        blur_variants = [
+            A.MotionBlur(blur_limit=(3, 7), p=1.0),
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+        ]
+        transforms.append(A.OneOf(blur_variants, p=config.blur_prob))
+
+    if config.noise_prob > 0.0:
+        noise_variants = [
+            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.ISONoise(color_shift=(0.0, 0.02), intensity=(0.0, 0.04), p=1.0),
+        ]
+        transforms.append(A.OneOf(noise_variants, p=config.noise_prob))
+
+    if config.channel_dropout_prob > 0.0:
+        transforms.append(
+            A.ChannelDropout(
+                channel_drop_range=(1, 1),
+                fill_value=0,
+                p=config.channel_dropout_prob,
+            )
+        )
+
+    if config.grayscale_prob > 0.0:
+        transforms.append(A.ToGray(p=config.grayscale_prob))
+
+    if config.coarse_dropout_prob > 0.0 and config.coarse_dropout_max_size > 0.0:
+        max_size = max(1, int(config.input_size * config.coarse_dropout_max_size))
+        transforms.append(
+            A.CoarseDropout(
+                max_holes=max(1, config.coarse_dropout_max_holes),
+                max_height=max_size,
+                max_width=max_size,
+                min_holes=1,
+                min_height=max(1, max_size // 2),
+                min_width=max(1, max_size // 2),
+                fill_value=0,
+                p=config.coarse_dropout_prob,
+            )
+        )
+
+    if not transforms:
+        return None
+
+    return A.Compose(transforms)
 
 
 # --------------------------------------------------------------------------------------
@@ -913,18 +1014,7 @@ def create_dataloaders(
     val_records: Sequence[ImageRecord],
     config: TrainingConfig,
 ) -> tuple[DataLoader, DataLoader]:
-    color_transform = A.Compose(
-        [
-            A.OneOf(
-                [
-                    A.ColorJitter(0.1, 0.1, 0.1, 0.05, p=1.0),
-                    A.RandomBrightnessContrast(0.15, 0.15, p=1.0),
-                ],
-                p=0.9,
-            ),
-            A.ISONoise(color_shift=(0.0, 0.02), intensity=(0.0, 0.02), p=0.2),
-        ]
-    )
+    color_transform = build_color_augmentation(config)
 
     train_dataset = BotbBallDataset(
         train_records,
@@ -1201,6 +1291,24 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("ema_decay must be within [0, 1)")
     if config.ema_start_epoch < 1:
         raise ValueError("ema_start_epoch must be at least 1")
+    for name in (
+        "color_aug_prob",
+        "grayscale_prob",
+        "blur_prob",
+        "noise_prob",
+        "random_gamma_prob",
+        "channel_dropout_prob",
+        "coarse_dropout_prob",
+    ):
+        value = getattr(config, name)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"{name} must be within [0, 1]")
+    if config.coarse_dropout_max_holes < 0:
+        raise ValueError("coarse_dropout_max_holes must be non-negative")
+    if config.coarse_dropout_max_size < 0.0:
+        raise ValueError("coarse_dropout_max_size must be non-negative")
+    if config.color_jitter_strength < 0.0:
+        raise ValueError("color_jitter_strength must be non-negative")
 
 
 # --------------------------------------------------------------------------------------
@@ -1239,7 +1347,77 @@ def parse_args() -> TrainingConfig:
         "--decoder-dropout",
         type=float,
         default=None,
-        help="Dropout rate applied in the decoder head (default: 0.0)",
+        help="Dropout rate applied in the decoder head (default: 0.15)",
+    )
+    parser.add_argument(
+        "--disable-spatial-aug",
+        action="store_true",
+        help="Disable spatial data augmentation",
+    )
+    parser.add_argument(
+        "--disable-color-aug",
+        action="store_true",
+        help="Disable appearance augmentation",
+    )
+    parser.add_argument(
+        "--color-aug-prob",
+        type=float,
+        default=None,
+        help="Probability of applying a colour jitter variant",
+    )
+    parser.add_argument(
+        "--color-jitter-strength",
+        type=float,
+        default=None,
+        help="Magnitude for colour jitter transforms",
+    )
+    parser.add_argument(
+        "--grayscale-prob",
+        type=float,
+        default=None,
+        help="Probability of converting images to grayscale",
+    )
+    parser.add_argument(
+        "--blur-prob",
+        type=float,
+        default=None,
+        help="Probability of applying blur augmentations",
+    )
+    parser.add_argument(
+        "--noise-prob",
+        type=float,
+        default=None,
+        help="Probability of injecting sensor noise",
+    )
+    parser.add_argument(
+        "--random-gamma-prob",
+        type=float,
+        default=None,
+        help="Probability of random gamma correction",
+    )
+    parser.add_argument(
+        "--channel-dropout-prob",
+        type=float,
+        default=None,
+        help="Probability of dropping random colour channels",
+    )
+    parser.add_argument(
+        "--coarse-dropout-prob",
+        type=float,
+        default=None,
+        help="Probability of coarse dropout occlusions",
+    )
+    parser.add_argument(
+        "--coarse-dropout-max-size",
+        type=float,
+        default=None,
+        help="Relative size of the largest coarse dropout patch",
+    )
+    parser.add_argument(
+        "--coarse-dropout-max-holes",
+        type=int,
+        default=None,
+        help="Maximum number of coarse dropout holes",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=None, help="Optimizer weight decay")
@@ -1345,6 +1523,30 @@ def parse_args() -> TrainingConfig:
         config.backbone_lr_multiplier = args.backbone_lr_multiplier
     if args.decoder_dropout is not None:
         config.decoder_dropout = args.decoder_dropout
+    if args.disable_spatial_aug:
+        config.enable_spatial_aug = False
+    if args.disable_color_aug:
+        config.enable_color_aug = False
+    if args.color_aug_prob is not None:
+        config.color_aug_prob = args.color_aug_prob
+    if args.color_jitter_strength is not None:
+        config.color_jitter_strength = args.color_jitter_strength
+    if args.grayscale_prob is not None:
+        config.grayscale_prob = args.grayscale_prob
+    if args.blur_prob is not None:
+        config.blur_prob = args.blur_prob
+    if args.noise_prob is not None:
+        config.noise_prob = args.noise_prob
+    if args.random_gamma_prob is not None:
+        config.random_gamma_prob = args.random_gamma_prob
+    if args.channel_dropout_prob is not None:
+        config.channel_dropout_prob = args.channel_dropout_prob
+    if args.coarse_dropout_prob is not None:
+        config.coarse_dropout_prob = args.coarse_dropout_prob
+    if args.coarse_dropout_max_size is not None:
+        config.coarse_dropout_max_size = args.coarse_dropout_max_size
+    if args.coarse_dropout_max_holes is not None:
+        config.coarse_dropout_max_holes = args.coarse_dropout_max_holes
     if args.learning_rate is not None:
         config.learning_rate = args.learning_rate
     if args.weight_decay is not None:
