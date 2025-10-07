@@ -33,6 +33,7 @@ transformer-based reasoning head) can reuse the same foundations.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import inspect
 import json
@@ -107,6 +108,7 @@ class TrainingConfig:
     pretrained: bool = True
     backbone_freeze_epochs: int = 0
     backbone_unfreeze_warmup: int = 0
+    backbone_lr_multiplier: float = 0.1
     decoder_dropout: float = 0.0
 
     # Training utilities
@@ -114,6 +116,8 @@ class TrainingConfig:
     validation_sample_count: int = 16
     amp: bool = torch.cuda.is_available()
     resume_from: Path | None = None
+    ema_decay: float = 0.999
+    ema_start_epoch: int = 1
 
     def device(self) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -687,6 +691,51 @@ class ValidationSampleExporter:
         return (x + offset_x) * scale, (y + offset_y) * scale
 
 
+class ModelEma:
+    """Maintain an exponential moving average of model parameters."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float,
+        *,
+        device: torch.device | None = None,
+    ) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError("EMA decay must lie within (0, 1)")
+
+        self.decay = float(decay)
+        self.device = device
+        self.ema_model = copy.deepcopy(model)
+        target_device = device if device is not None else next(model.parameters()).device
+        self.ema_model.to(device=target_device)
+        self.ema_model.eval()
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            for ema_param, model_param in zip(
+                self.ema_model.parameters(), model.parameters()
+            ):
+                ema_param.data.mul_(self.decay).add_(
+                    model_param.data, alpha=1.0 - self.decay
+                )
+            for ema_buffer, model_buffer in zip(
+                self.ema_model.buffers(), model.buffers()
+            ):
+                ema_buffer.copy_(model_buffer)
+
+    def state_dict(self) -> dict:
+        return {"model": self.ema_model.state_dict()}
+
+    def load_state_dict(self, state: dict) -> None:
+        if "model" in state:
+            self.ema_model.load_state_dict(state["model"])
+        else:
+            self.ema_model.load_state_dict(state)
+
+
 def split_backbone_parameters(
     model: nn.Module,
 ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
@@ -771,6 +820,7 @@ def save_checkpoint(
     metrics: dict[str, float],
     best_val_loss: float,
     is_best: bool,
+    ema: ModelEma | None,
 ) -> None:
     checkpoint_dir = config.output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -790,6 +840,8 @@ def save_checkpoint(
         state["scaler_state"] = scaler.state_dict()
     if scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
+    if ema is not None:
+        state["ema_state"] = ema.state_dict()
 
     last_path = checkpoint_dir / "last.pth"
     torch.save(state, last_path)
@@ -815,6 +867,7 @@ def resume_from_checkpoint(
     scaler: GradScaler | None,
     scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
     config: TrainingConfig,
+    ema: ModelEma | None,
 ) -> tuple[int, float]:
     checkpoint_path = resolve_resume_checkpoint(config)
     if checkpoint_path is None:
@@ -843,6 +896,8 @@ def resume_from_checkpoint(
         scaler.load_state_dict(state["scaler_state"])
     if scheduler is not None and "scheduler_state" in state:
         scheduler.load_state_dict(state["scheduler_state"])
+    if ema is not None and "ema_state" in state:
+        ema.load_state_dict(state["ema_state"])
 
     start_epoch = int(state.get("epoch", 0)) + 1
     best_val_loss = float(state.get("best_val_loss", float("inf")))
@@ -935,6 +990,7 @@ def train_one_epoch(
     scaler: GradScaler | None,
     config: TrainingConfig,
     epoch: int,
+    ema: ModelEma | None,
 ) -> dict[str, float]:
     model.train()
     loss_meter = 0.0
@@ -950,6 +1006,8 @@ def train_one_epoch(
     device = config.device()
     autocast_device_type = device.type
     trainable_params = [param for param in model.parameters() if param.requires_grad]
+
+    update_ema = ema is not None and epoch >= config.ema_start_epoch
 
     for step, batch in enumerate(progress, start=1):
         images = batch["image"].to(device)
@@ -990,6 +1048,9 @@ def train_one_epoch(
                         trainable_params, config.gradient_clip_norm
                     )
             optimizer.step()
+
+        if update_ema:
+            ema.update(model)
 
         batch_size = images.size(0)
         loss_meter += loss.detach().item() * batch_size
@@ -1034,6 +1095,7 @@ def validate(
     config: TrainingConfig,
     *,
     epoch: int | None = None,
+    export_samples: bool = True,
 ) -> dict[str, float]:
     model.eval()
     criterion = nn.MSELoss(reduction="none")
@@ -1046,7 +1108,7 @@ def validate(
     device = config.device()
 
     sample_exporter: ValidationSampleExporter | None = None
-    if config.validation_sample_count > 0:
+    if export_samples and config.validation_sample_count > 0:
         export_dir = config.output_dir / "validation_samples"
         if epoch is not None:
             export_dir = export_dir / f"epoch_{epoch:03d}"
@@ -1133,6 +1195,12 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("decoder_dropout must be non-negative")
     if config.decoder_dropout >= 1.0:
         raise ValueError("decoder_dropout must be less than 1.0")
+    if config.backbone_lr_multiplier <= 0.0:
+        raise ValueError("backbone_lr_multiplier must be positive")
+    if config.ema_decay < 0.0 or config.ema_decay >= 1.0:
+        raise ValueError("ema_decay must be within [0, 1)")
+    if config.ema_start_epoch < 1:
+        raise ValueError("ema_start_epoch must be at least 1")
 
 
 # --------------------------------------------------------------------------------------
@@ -1160,6 +1228,12 @@ def parse_args() -> TrainingConfig:
         type=int,
         default=None,
         help="Epochs to linearly warm up the backbone learning rate after unfreezing",
+    )
+    parser.add_argument(
+        "--backbone-lr-multiplier",
+        type=float,
+        default=None,
+        help="Multiplier applied to the learning rate for backbone parameters (default: 0.1)",
     )
     parser.add_argument(
         "--decoder-dropout",
@@ -1233,6 +1307,18 @@ def parse_args() -> TrainingConfig:
         help="Disable automatic mixed precision even when CUDA is available",
     )
     parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=None,
+        help="EMA decay factor (set to 0 to disable EMA tracking)",
+    )
+    parser.add_argument(
+        "--ema-start-epoch",
+        type=int,
+        default=None,
+        help="Epoch to begin EMA updates (default: 1)",
+    )
+    parser.add_argument(
         "--config-dump",
         action="store_true",
         help="Print resolved configuration and exit",
@@ -1255,6 +1341,8 @@ def parse_args() -> TrainingConfig:
         config.backbone_freeze_epochs = args.backbone_freeze_epochs
     if args.backbone_unfreeze_warmup is not None:
         config.backbone_unfreeze_warmup = args.backbone_unfreeze_warmup
+    if args.backbone_lr_multiplier is not None:
+        config.backbone_lr_multiplier = args.backbone_lr_multiplier
     if args.decoder_dropout is not None:
         config.decoder_dropout = args.decoder_dropout
     if args.learning_rate is not None:
@@ -1289,6 +1377,10 @@ def parse_args() -> TrainingConfig:
         config.validation_sample_count = args.val_sample_count
     if args.no_amp:
         config.amp = False
+    if args.ema_decay is not None:
+        config.ema_decay = args.ema_decay
+    if args.ema_start_epoch is not None:
+        config.ema_start_epoch = args.ema_start_epoch
 
     if args.config_dump:
         print(json.dumps(dataclasses.asdict(config), indent=2, default=str))
@@ -1323,13 +1415,18 @@ def main() -> None:  # pragma: no cover - CLI entry point
     )
     model.to(config.device())
 
+    ema: ModelEma | None = None
+    if 0.0 < config.ema_decay < 1.0:
+        ema = ModelEma(model, config.ema_decay, device=config.device())
+
     backbone_frozen = maybe_freeze_backbone(model, config.backbone_freeze_epochs)
     backbone_params, other_params = split_backbone_parameters(model)
     optimizer_param_groups: list[dict[str, object]] = []
     if other_params:
         optimizer_param_groups.append({"params": other_params})
     if backbone_params:
-        optimizer_param_groups.append({"params": backbone_params})
+        backbone_lr = config.learning_rate * config.backbone_lr_multiplier
+        optimizer_param_groups.append({"params": backbone_params, "lr": backbone_lr})
     if not optimizer_param_groups:
         raise RuntimeError("No parameters were found for optimisation")
 
@@ -1371,7 +1468,7 @@ def main() -> None:  # pragma: no cover - CLI entry point
     best_val_loss = min(history_best_candidates, default=float("inf"))
 
     start_epoch, checkpoint_best = resume_from_checkpoint(
-        model, optimizer, scaler, scheduler, config
+        model, optimizer, scaler, scheduler, config, ema
     )
     if backbone_param_ids:
         backbone_group = find_param_group_for_params(optimizer, backbone_param_ids)
@@ -1408,9 +1505,27 @@ def main() -> None:  # pragma: no cover - CLI entry point
                     backbone_frozen = False
                 backbone_group["lr"] = base_lr * lr_scale
         train_metrics = train_one_epoch(
-            model, optimizer, train_loader, scaler, config, epoch
+            model, optimizer, train_loader, scaler, config, epoch, ema
         )
-        val_metrics = validate(model, val_loader, config, epoch=epoch)
+
+        use_ema_for_eval = ema is not None and epoch >= config.ema_start_epoch
+        eval_model = ema.ema_model if use_ema_for_eval else model
+        val_metrics = validate(
+            eval_model,
+            val_loader,
+            config,
+            epoch=epoch,
+            export_samples=True,
+        )
+        if use_ema_for_eval:
+            raw_val_metrics = validate(
+                model,
+                val_loader,
+                config,
+                epoch=None,
+                export_samples=False,
+            )
+            val_metrics.update({f"raw_{k}": v for k, v in raw_val_metrics.items()})
 
         combined = {"epoch": epoch}
         combined.update({f"train_{k}": v for k, v in train_metrics.items()})
@@ -1419,7 +1534,7 @@ def main() -> None:  # pragma: no cover - CLI entry point
         combined["heatmap_bg_weight"] = config.heatmap_bg_weight
         history.append(combined)
 
-        print(
+        message = (
             f"Epoch {epoch:03d} | "
             f"train_loss={train_metrics['loss']:.4f} | "
             f"train_pixel_mae={train_metrics['pixel_mae']:.2f} | "
@@ -1427,6 +1542,12 @@ def main() -> None:  # pragma: no cover - CLI entry point
             f"val_loss={val_metrics['val_loss']:.4f} | "
             f"val_pixel_mae={val_metrics['val_pixel_mae']:.2f}"
         )
+        if "raw_val_loss" in val_metrics and "raw_val_pixel_mae" in val_metrics:
+            message += (
+                f" | raw_val_loss={val_metrics['raw_val_loss']:.4f}"
+                f" | raw_val_pixel_mae={val_metrics['raw_val_pixel_mae']:.2f}"
+            )
+        print(message)
 
         current_val_loss = float(val_metrics.get("val_loss", float("inf")))
         is_best = current_val_loss < best_val_loss
@@ -1447,6 +1568,7 @@ def main() -> None:  # pragma: no cover - CLI entry point
             val_metrics,
             best_val_loss,
             is_best,
+            ema,
         )
 
     with history_path.open("w", encoding="utf-8") as f:
