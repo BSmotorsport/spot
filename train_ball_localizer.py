@@ -893,14 +893,24 @@ def create_dataloaders(
 def compute_weighted_loss_components(
     loss_map: torch.Tensor, targets: torch.Tensor, config: TrainingConfig
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return the normalised loss along with its raw components."""
+    """Return the combined loss alongside the foreground/background terms."""
 
-    weight_range = config.heatmap_fg_weight - config.heatmap_bg_weight
-    weights = config.heatmap_bg_weight + weight_range * targets
-    weighted_loss = loss_map * weights
-    weight_sum = weights.sum(dtype=torch.float32)
-    loss = weighted_loss.sum(dtype=torch.float32) / (weight_sum + 1e-12)
-    return loss, weighted_loss, weight_sum
+    # ``loss_map`` arrives in the autocast dtype (float16 on CUDA).  Upcasting to
+    # ``float32`` ensures the reductions are numerically stable without breaking
+    # the gradient graph.
+    loss_map_f32 = loss_map.to(dtype=torch.float32)
+    targets_f32 = targets.to(dtype=torch.float32)
+
+    bg_mask = torch.clamp(1.0 - targets_f32, min=0.0, max=1.0)
+
+    fg_norm = targets_f32.sum(dtype=torch.float32).clamp_min(1e-12)
+    bg_norm = bg_mask.sum(dtype=torch.float32).clamp_min(1e-12)
+
+    fg_loss = (loss_map_f32 * targets_f32).sum(dtype=torch.float32) / fg_norm
+    bg_loss = (loss_map_f32 * bg_mask).sum(dtype=torch.float32) / bg_norm
+
+    loss = config.heatmap_fg_weight * fg_loss + config.heatmap_bg_weight * bg_loss
+    return loss, fg_loss, bg_loss
 
 
 def train_one_epoch(
@@ -913,6 +923,8 @@ def train_one_epoch(
 ) -> dict[str, float]:
     model.train()
     loss_meter = 0.0
+    fg_loss_meter = 0.0
+    bg_loss_meter = 0.0
     weight_meter = 0.0
     pixel_error_sum = 0.0
     pixel_error_count = 0
@@ -941,11 +953,9 @@ def train_one_epoch(
             pixel_error_count += len(batch_pixel_errors)
             pixel_error_values.extend(float(err) for err in batch_pixel_errors)
 
-        (
-            loss,
-            weighted_loss,
-            weight_sum,
-        ) = compute_weighted_loss_components(loss_map, targets, config)
+        loss, fg_loss, bg_loss = compute_weighted_loss_components(
+            loss_map, targets, config
+        )
 
         if scaler is not None and config.amp:
             scaler.scale(loss).backward()
@@ -966,16 +976,17 @@ def train_one_epoch(
                     )
             optimizer.step()
 
-        weighted_loss_sum = (
-            weighted_loss.detach().sum(dtype=torch.float32).item()
-        )
-        weight_sum_value = weight_sum.detach().item()
-        loss_meter += weighted_loss_sum
-        weight_meter += weight_sum_value
+        batch_size = images.size(0)
+        loss_meter += loss.detach().item() * batch_size
+        fg_loss_meter += fg_loss.detach().item() * batch_size
+        bg_loss_meter += bg_loss.detach().item() * batch_size
+        weight_meter += batch_size
 
         if step % config.log_every == 0:
             avg_loss = loss_meter / max(weight_meter, 1e-12)
             running_metrics: dict[str, float] = {"loss": avg_loss}
+            running_metrics["loss_fg"] = fg_loss.detach().item()
+            running_metrics["loss_bg"] = bg_loss.detach().item()
             if pixel_error_count > 0:
                 running_metrics["pixel_mae"] = pixel_error_sum / pixel_error_count
                 running_metrics["pixel_median"] = float(
@@ -984,6 +995,8 @@ def train_one_epoch(
             progress.set_postfix(running_metrics)
 
     avg_loss = loss_meter / max(weight_meter, 1e-12)
+    avg_fg_loss = fg_loss_meter / max(weight_meter, 1e-12)
+    avg_bg_loss = bg_loss_meter / max(weight_meter, 1e-12)
     avg_pixel_mae = (
         pixel_error_sum / pixel_error_count if pixel_error_count > 0 else float("nan")
     )
@@ -992,6 +1005,8 @@ def train_one_epoch(
     )
     return {
         "loss": avg_loss,
+        "loss_fg": avg_fg_loss,
+        "loss_bg": avg_bg_loss,
         "pixel_mae": avg_pixel_mae,
         "pixel_median": avg_pixel_median,
     }
@@ -1009,6 +1024,8 @@ def validate(
     criterion = nn.MSELoss(reduction="none")
 
     loss_meter = 0.0
+    fg_loss_meter = 0.0
+    bg_loss_meter = 0.0
     weight_meter = 0.0
     pixel_errors: List[float] = []
     device = config.device()
@@ -1028,27 +1045,35 @@ def validate(
 
         outputs = model(images)
         loss_map = criterion(outputs, targets)
-        loss, weighted_loss, weight_sum = compute_weighted_loss_components(
+        loss, fg_loss, bg_loss = compute_weighted_loss_components(
             loss_map, targets, config
         )
 
         metrics = compute_metrics(outputs, batch, config)
         pixel_errors.extend(metrics.get("pixel_errors", []))
 
+        batch_size = images.size(0)
+        loss_meter += loss.detach().item() * batch_size
+        fg_loss_meter += fg_loss.detach().item() * batch_size
+        bg_loss_meter += bg_loss.detach().item() * batch_size
+        weight_meter += batch_size
+
         if sample_exporter is not None:
             probs = torch.sigmoid(outputs)
             sample_exporter.save_batch(batch, probs)
 
-        weighted_loss_sum = (
-            weighted_loss.detach().sum(dtype=torch.float32).item()
-        )
-        weight_sum_value = weight_sum.detach().item()
-        loss_meter += weighted_loss_sum
-        weight_meter += weight_sum_value
-
     avg_loss = loss_meter / max(weight_meter, 1e-12)
+    avg_fg_loss = fg_loss_meter / max(weight_meter, 1e-12)
+    avg_bg_loss = bg_loss_meter / max(weight_meter, 1e-12)
     avg_pixel_error = float(np.mean(pixel_errors)) if pixel_errors else float("nan")
-    return {"val_loss": avg_loss, "val_pixel_mae": avg_pixel_error}
+    if sample_exporter is not None:
+        sample_exporter.flush()
+    return {
+        "val_loss": avg_loss,
+        "val_loss_fg": avg_fg_loss,
+        "val_loss_bg": avg_bg_loss,
+        "val_pixel_mae": avg_pixel_error,
+    }
 
 
 def setup_seed(seed: int) -> None:
