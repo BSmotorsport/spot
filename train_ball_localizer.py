@@ -625,6 +625,19 @@ class ValidationSampleExporter:
             if self.saved >= self.max_samples:
                 break
 
+    def flush(self) -> None:
+        """Flush any buffered outputs to disk.
+
+        The exporter writes images immediately when ``save_batch`` is called, so
+        there is no buffered state to clear.  The method exists to maintain API
+        compatibility with callers that expect a ``flush`` hook.
+        """
+
+        # Intentionally a no-op.  Keeping the method allows callers to invoke
+        # ``flush`` unconditionally without needing to guard against an
+        # ``AttributeError`` when validation is configured to export samples.
+        return
+
     def _denormalize_image(self, tensor: torch.Tensor) -> np.ndarray:
         array = tensor.detach().cpu().permute(1, 2, 0).numpy()
         array = array * self._std + self._mean
