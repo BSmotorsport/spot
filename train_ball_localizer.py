@@ -399,6 +399,125 @@ class BotbBallDataset(Dataset):
 # --------------------------------------------------------------------------------------
 
 
+def _gauss_noise_kwargs(p: float) -> dict[str, object]:
+    """Return keyword arguments compatible with the installed albumentations version."""
+
+    params = set(inspect.signature(A.GaussNoise.__init__).parameters)
+
+    kwargs: dict[str, object] = {"p": p}
+    var_limit = (10.0, 50.0)
+
+    if "var_limit" in params:
+        kwargs["var_limit"] = var_limit
+    elif "variance_limit" in params:
+        kwargs["variance_limit"] = var_limit
+
+    return kwargs
+
+
+def _channel_dropout_kwargs(p: float) -> dict[str, object]:
+    """Return keyword arguments that avoid deprecated albumentations names."""
+
+    params = set(inspect.signature(A.ChannelDropout.__init__).parameters)
+
+    kwargs: dict[str, object] = {"p": p}
+
+    if "channel_drop_range" in params:
+        kwargs["channel_drop_range"] = (1, 1)
+
+    if "fill_value" in params:
+        kwargs["fill_value"] = 0
+    elif "drop_value" in params:
+        kwargs["drop_value"] = 0
+
+    return kwargs
+
+
+def _assign_range(
+    params: set[str],
+    kwargs: dict[str, object],
+    *,
+    max_key: str,
+    min_key: str | None,
+    range_candidates: tuple[str, ...],
+    min_value: int,
+    max_value: int,
+) -> None:
+    """Populate ``kwargs`` with the best-supported range-style argument."""
+
+    if max_key in params:
+        kwargs[max_key] = max_value
+        if min_key and min_key in params:
+            kwargs[min_key] = min_value
+        return
+
+    for candidate in range_candidates:
+        if candidate in params:
+            kwargs[candidate] = (min_value, max_value)
+            return
+
+
+def _coarse_dropout_kwargs(
+    *,
+    p: float,
+    max_holes: int,
+    min_holes: int,
+    min_size: int,
+    max_size: int,
+) -> dict[str, object]:
+    """Return albumentations-compatible keyword arguments for ``CoarseDropout``."""
+
+    params = set(inspect.signature(A.CoarseDropout.__init__).parameters)
+    kwargs: dict[str, object] = {"p": p}
+
+    _assign_range(
+        params,
+        kwargs,
+        max_key="max_holes",
+        min_key="min_holes",
+        range_candidates=(
+            "holes_range",
+            "num_holes_range",
+            "holes_number_range",
+        ),
+        min_value=min_holes,
+        max_value=max_holes,
+    )
+
+    _assign_range(
+        params,
+        kwargs,
+        max_key="max_height",
+        min_key="min_height",
+        range_candidates=(
+            "height_range",
+            "hole_height_range",
+        ),
+        min_value=min_size,
+        max_value=max_size,
+    )
+
+    _assign_range(
+        params,
+        kwargs,
+        max_key="max_width",
+        min_key="min_width",
+        range_candidates=(
+            "width_range",
+            "hole_width_range",
+        ),
+        min_value=min_size,
+        max_value=max_size,
+    )
+
+    if "fill_value" in params:
+        kwargs["fill_value"] = 0
+    elif "mask_fill_value" in params:
+        kwargs["mask_fill_value"] = 0
+
+    return kwargs
+
+
 def build_color_augmentation(config: TrainingConfig) -> A.BasicTransform | None:
     """Construct a rich appearance augmentation pipeline."""
 
@@ -444,35 +563,29 @@ def build_color_augmentation(config: TrainingConfig) -> A.BasicTransform | None:
 
     if config.noise_prob > 0.0:
         noise_variants = [
-            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.GaussNoise(**_gauss_noise_kwargs(p=1.0)),
             A.ISONoise(color_shift=(0.0, 0.02), intensity=(0.0, 0.04), p=1.0),
         ]
         transforms.append(A.OneOf(noise_variants, p=config.noise_prob))
 
     if config.channel_dropout_prob > 0.0:
-        transforms.append(
-            A.ChannelDropout(
-                channel_drop_range=(1, 1),
-                fill_value=0,
-                p=config.channel_dropout_prob,
-            )
-        )
+        transforms.append(A.ChannelDropout(**_channel_dropout_kwargs(p=config.channel_dropout_prob)))
 
     if config.grayscale_prob > 0.0:
         transforms.append(A.ToGray(p=config.grayscale_prob))
 
     if config.coarse_dropout_prob > 0.0 and config.coarse_dropout_max_size > 0.0:
         max_size = max(1, int(config.input_size * config.coarse_dropout_max_size))
+        min_size = max(1, max_size // 2)
         transforms.append(
             A.CoarseDropout(
-                max_holes=max(1, config.coarse_dropout_max_holes),
-                max_height=max_size,
-                max_width=max_size,
-                min_holes=1,
-                min_height=max(1, max_size // 2),
-                min_width=max(1, max_size // 2),
-                fill_value=0,
-                p=config.coarse_dropout_prob,
+                **_coarse_dropout_kwargs(
+                    p=config.coarse_dropout_prob,
+                    max_holes=max(1, config.coarse_dropout_max_holes),
+                    min_holes=1,
+                    min_size=min_size,
+                    max_size=max_size,
+                )
             )
         )
 
