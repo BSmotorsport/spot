@@ -326,23 +326,17 @@ class BotbBallDataset(Dataset):
             self.config.spatial_crop_prob > 0.0
             and self.config.spatial_crop_scale_min < self.config.spatial_crop_scale_max
         ):
-            crop_kwargs: dict[str, object] = {
-                "scale": (
-                    self.config.spatial_crop_scale_min,
-                    self.config.spatial_crop_scale_max,
-                ),
-                "ratio": (1.0, 1.0),
-                "p": self.config.spatial_crop_prob,
-            }
-
-            crop_signature = inspect.signature(A.RandomResizedCrop.__init__)
-            if "size" in crop_signature.parameters:
-                crop_kwargs["size"] = (height, width)
-            else:
-                crop_kwargs["height"] = height
-                crop_kwargs["width"] = width
-
-            transforms.append(A.RandomResizedCrop(**crop_kwargs))
+            transforms.append(
+                A.RandomResizedCrop(
+                    size=(height, width),
+                    scale=(
+                        self.config.spatial_crop_scale_min,
+                        self.config.spatial_crop_scale_max,
+                    ),
+                    ratio=(1.0, 1.0),
+                    p=self.config.spatial_crop_prob,
+                )
+            )
 
         if not transforms:
             transforms.append(A.NoOp())
