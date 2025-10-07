@@ -442,19 +442,21 @@ def _assign_range(
     range_candidates: tuple[str, ...],
     min_value: int,
     max_value: int,
-) -> None:
+) -> str | None:
     """Populate ``kwargs`` with the best-supported range-style argument."""
 
     if max_key in params:
         kwargs[max_key] = max_value
         if min_key and min_key in params:
             kwargs[min_key] = min_value
-        return
+        return max_key
 
     for candidate in range_candidates:
         if candidate in params:
             kwargs[candidate] = (min_value, max_value)
-            return
+            return candidate
+
+    return None
 
 
 def _coarse_dropout_kwargs(
@@ -464,6 +466,8 @@ def _coarse_dropout_kwargs(
     min_holes: int,
     min_size: int,
     max_size: int,
+    image_height: int,
+    image_width: int,
 ) -> dict[str, object]:
     """Return albumentations-compatible keyword arguments for ``CoarseDropout``."""
 
@@ -484,7 +488,7 @@ def _coarse_dropout_kwargs(
         max_value=max_holes,
     )
 
-    _assign_range(
+    height_key = _assign_range(
         params,
         kwargs,
         max_key="max_height",
@@ -497,7 +501,7 @@ def _coarse_dropout_kwargs(
         max_value=max_size,
     )
 
-    _assign_range(
+    width_key = _assign_range(
         params,
         kwargs,
         max_key="max_width",
@@ -509,6 +513,22 @@ def _coarse_dropout_kwargs(
         min_value=min_size,
         max_value=max_size,
     )
+
+    def _normalise_fractional_range(range_key: str | None, dimension: int) -> None:
+        if not range_key:
+            return
+        key_lower = range_key.lower()
+        if "hole" not in key_lower or "range" not in key_lower:
+            return
+        if "height" in key_lower or "width" in key_lower:
+            min_val, max_val = kwargs[range_key]
+            kwargs[range_key] = (
+                min_val / float(dimension),
+                max_val / float(dimension),
+            )
+
+    _normalise_fractional_range(height_key, image_height)
+    _normalise_fractional_range(width_key, image_width)
 
     if "fill_value" in params:
         kwargs["fill_value"] = 0
@@ -585,6 +605,8 @@ def build_color_augmentation(config: TrainingConfig) -> A.BasicTransform | None:
                     min_holes=1,
                     min_size=min_size,
                     max_size=max_size,
+                    image_height=config.input_size,
+                    image_width=config.input_size,
                 )
             )
         )
