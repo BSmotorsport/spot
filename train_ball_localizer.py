@@ -322,7 +322,8 @@ class BotbBallDataset(Dataset):
         ):
             transforms.append(
                 A.RandomResizedCrop(
-                    size=(height, width),
+                    height=height,
+                    width=width,
                     scale=(
                         self.config.spatial_crop_scale_min,
                         self.config.spatial_crop_scale_max,
