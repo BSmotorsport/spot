@@ -292,12 +292,27 @@ class BotbBallDataset(Dataset):
         if self.config.spatial_flip_prob > 0.0:
             transforms.append(A.HorizontalFlip(p=self.config.spatial_flip_prob))
         if self.config.spatial_shift_scale_prob > 0.0:
+            shift_limit = self.config.spatial_shift_limit
+            scale_limit = self.config.spatial_scale_limit
+            rotate_limit = self.config.spatial_rotate_limit
+
+            # ``ShiftScaleRotate`` was deprecated in Albumentations 2.0 in favour of
+            # the more general ``Affine`` transform.  Replicate the previous
+            # behaviour by building symmetric ranges for translation/scale/rotation
+            # that mirror the semantics of the old helper.
+            min_scale = max(1.0 - scale_limit, 0.0)
+            max_scale = 1.0 + scale_limit
+
             transforms.append(
-                A.ShiftScaleRotate(
-                    shift_limit=self.config.spatial_shift_limit,
-                    scale_limit=self.config.spatial_scale_limit,
-                    rotate_limit=self.config.spatial_rotate_limit,
-                    border_mode=cv2.BORDER_REFLECT_101,
+                A.Affine(
+                    translate_percent={
+                        "x": (-shift_limit, shift_limit),
+                        "y": (-shift_limit, shift_limit),
+                    },
+                    scale=(min_scale, max_scale),
+                    rotate=(-rotate_limit, rotate_limit),
+                    mode=cv2.BORDER_REFLECT_101,
+                    fit_output=False,
                     p=self.config.spatial_shift_scale_prob,
                 )
             )
@@ -307,8 +322,7 @@ class BotbBallDataset(Dataset):
         ):
             transforms.append(
                 A.RandomResizedCrop(
-                    height=height,
-                    width=width,
+                    size=(height, width),
                     scale=(
                         self.config.spatial_crop_scale_min,
                         self.config.spatial_crop_scale_max,
