@@ -303,35 +303,46 @@ class BotbBallDataset(Dataset):
             min_scale = max(1.0 - scale_limit, 0.0)
             max_scale = 1.0 + scale_limit
 
-            transforms.append(
-                A.Affine(
-                    translate_percent={
-                        "x": (-shift_limit, shift_limit),
-                        "y": (-shift_limit, shift_limit),
-                    },
-                    scale=(min_scale, max_scale),
-                    rotate=(-rotate_limit, rotate_limit),
-                    mode=cv2.BORDER_REFLECT_101,
-                    fit_output=False,
-                    p=self.config.spatial_shift_scale_prob,
-                )
-            )
+            affine_kwargs: dict[str, object] = {
+                "translate_percent": {
+                    "x": (-shift_limit, shift_limit),
+                    "y": (-shift_limit, shift_limit),
+                },
+                "scale": (min_scale, max_scale),
+                "rotate": (-rotate_limit, rotate_limit),
+                "fit_output": False,
+                "p": self.config.spatial_shift_scale_prob,
+            }
+
+            # Albumentations 2.x renamed the ``mode`` argument to ``border_mode``.
+            affine_signature = inspect.signature(A.Affine.__init__)
+            if "border_mode" in affine_signature.parameters:
+                affine_kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+            elif "mode" in affine_signature.parameters:
+                affine_kwargs["mode"] = cv2.BORDER_REFLECT_101
+
+            transforms.append(A.Affine(**affine_kwargs))
         if (
             self.config.spatial_crop_prob > 0.0
             and self.config.spatial_crop_scale_min < self.config.spatial_crop_scale_max
         ):
-            transforms.append(
-                A.RandomResizedCrop(
-                    height=height,
-                    width=width,
-                    scale=(
-                        self.config.spatial_crop_scale_min,
-                        self.config.spatial_crop_scale_max,
-                    ),
-                    ratio=(1.0, 1.0),
-                    p=self.config.spatial_crop_prob,
-                )
-            )
+            crop_kwargs: dict[str, object] = {
+                "scale": (
+                    self.config.spatial_crop_scale_min,
+                    self.config.spatial_crop_scale_max,
+                ),
+                "ratio": (1.0, 1.0),
+                "p": self.config.spatial_crop_prob,
+            }
+
+            crop_signature = inspect.signature(A.RandomResizedCrop.__init__)
+            if "size" in crop_signature.parameters:
+                crop_kwargs["size"] = (height, width)
+            else:
+                crop_kwargs["height"] = height
+                crop_kwargs["width"] = width
+
+            transforms.append(A.RandomResizedCrop(**crop_kwargs))
 
         if not transforms:
             transforms.append(A.NoOp())
