@@ -5,6 +5,8 @@ from math import cos, sin
 from pathlib import Path
 import subprocess
 import re
+import time
+from typing import Union
 
 import numpy as np
 import torch
@@ -37,8 +39,11 @@ def natural_keys(text):
     '''
     return [ atoi(c) for c in re.split(r'(\d+)', text) ]
 
-def prep_input_numpy(img:np.ndarray, device:str):
+def prep_input_numpy(img: np.ndarray, device: Union[str, torch.device]):
     """Preparing a Numpy Array as input to L2CS-Net."""
+
+    if isinstance(device, str):
+        device = torch.device(device)
 
     if len(img.shape) == 4:
         imgs = []
@@ -126,6 +131,13 @@ def git_describe(path=Path(__file__).parent):  # path must be a directory
         return subprocess.check_output(s, shell=True, stderr=subprocess.STDOUT).decode()[:-1]
     except subprocess.CalledProcessError as e:
         return ''  # not a git repository
+
+
+def date_modified(path: Path = Path(__file__).parent) -> str:
+    """Return a git-independent timestamp string for select_device fallback."""
+
+    timestamp = path.stat().st_mtime
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
         
 def getArch(arch,bins):
     # Base network structure
