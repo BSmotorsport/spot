@@ -206,7 +206,7 @@ class InteractiveBallPredictor:
         
         if self.results is None:
             return
-        
+
         # Find which face was clicked
         for i in range(self.results.num_faces):
             bbox = self.results.bboxes[i]
@@ -324,7 +324,7 @@ class InteractiveBallPredictor:
                 try:
                     user_input = input()
                     numbers = [int(x.strip())-1 for x in user_input.split()]
-                    
+
                     if len(numbers) == 2:
                         if all(0 <= n < self.results.num_faces for n in numbers):
                             self.selected_faces = numbers
