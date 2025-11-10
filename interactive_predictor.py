@@ -54,8 +54,13 @@ class InteractiveBallPredictor:
         
         # L2CS draw_gaze formula
         length = bbox_width * length_multiplier
-        dx = -length * np.sin(pitch_rad) * np.cos(yaw_rad)
-        dy = -length * np.sin(yaw_rad)
+        # Convert pitch/yaw (radians) into 2D offsets on the image plane where
+        # yaw controls horizontal motion and pitch controls vertical motion.
+        # The horizontal component follows the standard L2CS gaze vector
+        # (scaled by cos(pitch) to keep the projection consistent) and the
+        # vertical component is positive when looking downward in image space.
+        dx = -length * np.cos(pitch_rad) * np.sin(yaw_rad)
+        dy = length * np.sin(pitch_rad)
         
         endpoint = origin + np.array([dx, dy])
         direction = endpoint - origin
