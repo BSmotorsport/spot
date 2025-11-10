@@ -115,7 +115,7 @@ class InteractiveBallPredictor:
             return
         
         # Draw all faces with numbers
-        for i in range(len(self.results.bboxes)):
+        for i in range(self.results.num_faces):
             bbox = self.results.bboxes[i]
             x1, y1, x2, y2 = [int(v) for v in bbox]
             
@@ -208,7 +208,7 @@ class InteractiveBallPredictor:
             return
         
         # Find which face was clicked
-        for i in range(len(self.results.bboxes)):
+        for i in range(self.results.num_faces):
             bbox = self.results.bboxes[i]
             x1, y1, x2, y2 = [int(v) for v in bbox]
             
@@ -259,14 +259,14 @@ class InteractiveBallPredictor:
         print("Detecting faces...")
         self.results = self.pipeline.step(self.image)
         
-        print(f"Found {len(self.results.bboxes)} faces\n")
-        
-        if len(self.results.bboxes) == 0:
+        print(f"Found {self.results.num_faces} faces\n")
+
+        if self.results.num_faces == 0:
             print("No faces detected")
             return
-        
+
         # Show face info
-        for i in range(len(self.results.bboxes)):
+        for i in range(self.results.num_faces):
             pitch = self.results.pitch[i] * 180 / np.pi
             yaw = self.results.yaw[i] * 180 / np.pi
             score = self.results.scores[i]
@@ -326,7 +326,7 @@ class InteractiveBallPredictor:
                     numbers = [int(x.strip())-1 for x in user_input.split()]
                     
                     if len(numbers) == 2:
-                        if all(0 <= n < len(self.results.bboxes) for n in numbers):
+                        if all(0 <= n < self.results.num_faces for n in numbers):
                             self.selected_faces = numbers
                             print(f"Selected faces: {[n+1 for n in numbers]}")
                         else:
